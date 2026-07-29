@@ -1,0 +1,53 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Build and packaging output
+build/
+dist/
+windows/.venv/
+windows/runtime/
+macos/.venv/
+macos/runtime/
+*.spec.bak
+*.log
+
+# Local game bundles and signing secrets
+*.apk
+*.apks
+*.aab
+*.obb
+*.jks
+*.keystore
+signing-key.json
+signing-key-backup.json
+release.manifest
+RENAMED-BUNDLE.txt
+
+# Editors and operating systems
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Temporary files
+.cache/
+tmp/
+temp/
+*.tmp
+*.bak

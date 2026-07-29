@@ -1,0 +1,31 @@
+name: Feature request
+description: Suggest a safe improvement to the desktop workflow
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem would this solve?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed experience
+      description: Describe what the user would click and what the app would do.
+    validations:
+      required: true
+  - type: textarea
+    id: safety
+    attributes:
+      label: Safety considerations
+      description: Note effects on source files, signing keys, cleanup, or headset data.
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: Scope
+      options:
+        - label: This request is not for piracy, entitlement bypassing, or credential extraction.
+          required: true

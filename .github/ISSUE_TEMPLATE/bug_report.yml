@@ -1,0 +1,66 @@
+name: Bug report
+description: Report a reproducible problem with Quest APK Renamer
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not upload APKs, OBBs, signing keys, paid game data, headset serials,
+        or unsanitized logs.
+  - type: input
+    id: version
+    attributes:
+      label: App version
+      placeholder: "1.7.0"
+    validations:
+      required: true
+  - type: dropdown
+    id: operating-system
+    attributes:
+      label: Operating system
+      options:
+        - Windows 11
+        - Windows 10
+        - Linux
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: quest
+    attributes:
+      label: Quest model
+      placeholder: Quest 2, Quest 3, Quest 3S, or not connected
+  - type: textarea
+    id: problem
+    attributes:
+      label: What happened?
+      description: Include the stage that failed and the result you expected.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Choose a folder...
+        2. Change the package ID...
+        3. Select...
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: Sanitized details log
+      description: Remove private paths, game names, serials, and signing data.
+      render: text
+  - type: checkboxes
+    id: authorization
+    attributes:
+      label: Authorization and privacy
+      options:
+        - label: I own or am authorized to modify the software involved.
+          required: true
+        - label: I removed copyrighted game files, secrets, and identifying information.
+          required: true

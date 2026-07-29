@@ -1,0 +1,134 @@
+name: Build Windows app
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+    tags:
+      - "v*"
+    paths:
+      - "quest_apk_renamer.py"
+      - "tests/**"
+      - "assets/**"
+      - "tools/**"
+      - "vendor/**"
+      - "windows/**"
+      - "LICENSE"
+      - "THIRD_PARTY_NOTICES.md"
+      - ".github/workflows/windows-build.yml"
+
+permissions:
+  contents: write
+
+env:
+  APP_VERSION: "1.8.0"
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: windows/requirements-build.txt
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup --no-progress -y
+
+      - name: Validate release tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: |
+          $stableTag = "v$env:APP_VERSION"
+          $prereleasePattern = "$stableTag-*"
+          if (
+            $env:GITHUB_REF_NAME -ne $stableTag -and
+            $env:GITHUB_REF_NAME -notlike $prereleasePattern
+          ) {
+            throw "Tag $env:GITHUB_REF_NAME does not match app version $stableTag."
+          }
+
+      - name: Build and test
+        shell: pwsh
+        run: .\windows\build.ps1 -BuildInstaller
+
+      - name: Package release files
+        shell: pwsh
+        run: |
+          $portable = ".\dist\Quest APK Renamer"
+          $portableZip = ".\dist\Quest-APK-Renamer-$env:APP_VERSION-Windows-portable.zip"
+          Compress-Archive -Path "$portable\*" -DestinationPath $portableZip -Force
+
+          $installer = Get-ChildItem ".\dist\installer\*.exe" | Select-Object -First 1
+          if (-not $installer) {
+            throw "The Windows installer was not created."
+          }
+
+          $releaseFiles = @((Get-Item $portableZip), $installer)
+          $checksums = $releaseFiles | ForEach-Object {
+            $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$hash  $($_.Name)"
+          }
+          $checksums | Set-Content -Encoding ascii ".\dist\SHA256SUMS-Windows.txt"
+
+      - name: Upload portable Windows app
+        uses: actions/upload-artifact@v4
+        with:
+          name: Quest-APK-Renamer-${{ env.APP_VERSION }}-Windows-portable
+          path: dist/Quest APK Renamer/
+          if-no-files-found: error
+
+      - name: Upload Windows release bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: Quest-APK-Renamer-${{ env.APP_VERSION }}-Windows-release
+          path: |
+            dist/Quest-APK-Renamer-${{ env.APP_VERSION }}-Windows-portable.zip
+            dist/installer/*.exe
+            dist/SHA256SUMS-Windows.txt
+          if-no-files-found: error
+
+      - name: Create or update tagged GitHub release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          $title = "Quest APK Renamer " + $tag.TrimStart("v")
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -ne 0) {
+            $releaseArgs = @(
+              "release", "create", $tag,
+              "--title", $title
+            )
+            $notesFile = ".\docs\releases\v$env:APP_VERSION.md"
+            if (Test-Path $notesFile) {
+              $releaseArgs += @("--notes-file", $notesFile)
+            }
+            else {
+              $releaseArgs += "--generate-notes"
+            }
+            if ($tag.Contains("-")) {
+              $releaseArgs += "--prerelease"
+            }
+            & gh @releaseArgs
+          }
+          $portableZip = Get-Item ".\dist\Quest-APK-Renamer-$env:APP_VERSION-Windows-portable.zip"
+          $installer = Get-ChildItem ".\dist\installer\*.exe" | Select-Object -First 1
+          $checksums = Get-Item ".\dist\SHA256SUMS-Windows.txt"
+          gh release upload $tag `
+            $portableZip.FullName `
+            $installer.FullName `
+            $checksums.FullName `
+            --clobber
