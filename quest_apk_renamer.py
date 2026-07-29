@@ -13,6 +13,7 @@ import datetime as dt
 import hashlib
 import json
 import os
+import platform
 import queue
 import re
 import secrets
@@ -23,6 +24,7 @@ import sys
 import tempfile
 import threading
 import traceback
+import urllib.error
 import urllib.request
 import webbrowser
 from dataclasses import dataclass
@@ -43,12 +45,25 @@ from tkinter import (
     filedialog,
     font as tkfont,
     messagebox,
+    simpledialog,
     ttk,
 )
 
+from apk_analysis import (
+    compute_hashes,
+    detect_existing_tag,
+    identify_signer,
+    inspect_apk as analyze_apk_file,
+    inspect_decoded_apk,
+    inspect_signature,
+    load_signer_registry,
+    package_with_tag,
+    scan_package_references,
+    write_json_report,
+)
 
 APP_NAME = "Quest APK Renamer"
-APP_VERSION = "1.8.0"
+APP_VERSION = "1.9.0"
 PACKAGE_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9_]*(?:\.[a-zA-Z][a-zA-Z0-9_]*)+$")
 OBB_RE = re.compile(r"^(main|patch)\.(\d+)\.(.+)\.obb$", re.IGNORECASE)
 
@@ -71,6 +86,16 @@ APKTOOL_JAR = TOOLS_DIR / "apktool.jar"
 SIGNER_JAR = TOOLS_DIR / "uber-apk-signer.jar"
 TOOL_INFO_FILE = TOOLS_DIR / "versions.json"
 RUNTIME_DIR = RESOURCE_DIR / "runtime"
+SIGNER_REGISTRY_FILE = RESOURCE_DIR / "resources" / "known-signers.json"
+RELEASE_API_URL = (
+    "https://api.github.com/repos/RockoTheeHut/Quest-APK-Renamer/releases/latest"
+)
+TAGS_API_URL = (
+    "https://api.github.com/repos/RockoTheeHut/Quest-APK-Renamer/tags?per_page=1"
+)
+RELEASES_PAGE_URL = (
+    "https://github.com/RockoTheeHut/Quest-APK-Renamer/releases"
+)
 
 
 def platform_app_data() -> Path:
@@ -96,6 +121,7 @@ MANAGED_KEYSTORE = APP_DATA / "quest-renamer-signing-key.jks"
 MANAGED_KEY_INFO = APP_DATA / "signing-key.json"
 KEY_BACKUP_MARKER = APP_DATA / "signing-key-backup.json"
 SETTINGS_FILE = APP_DATA / "settings.json"
+SESSION_LOG_FILE = APP_DATA / "Quest-APK-Renamer.log"
 LINUX_LAUNCHER = (
     Path.home() / ".local" / "share" / "applications" / "quest-apk-renamer.desktop"
 )
@@ -129,6 +155,8 @@ TOOL_DOWNLOADS = {
 
 DEFAULT_SETTINGS = {
     "ask_signing_key_backup": True,
+    "check_updates": True,
+    "dismissed_update": "",
 }
 
 
@@ -138,10 +166,13 @@ def load_user_settings(path: Path = SETTINGS_FILE) -> dict[str, object]:
         stored = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return settings
-    if isinstance(stored, dict) and isinstance(
-        stored.get("ask_signing_key_backup"), bool
-    ):
-        settings["ask_signing_key_backup"] = stored["ask_signing_key_backup"]
+    if not isinstance(stored, dict):
+        return settings
+    for key in ("ask_signing_key_backup", "check_updates"):
+        if isinstance(stored.get(key), bool):
+            settings[key] = stored[key]
+    if isinstance(stored.get("dismissed_update"), str):
+        settings["dismissed_update"] = stored["dismissed_update"]
     return settings
 
 
@@ -156,6 +187,88 @@ def save_user_settings(
         encoding="utf-8",
     )
     temporary.replace(path)
+
+
+class SessionLogger:
+    """Small rotating log used for support reports across app sessions."""
+
+    def __init__(self, path: Path, max_bytes: int = 5 * 1024 * 1024) -> None:
+        self.path = path
+        self.max_bytes = max_bytes
+        self.lock = threading.Lock()
+        self._initialize()
+
+    def _initialize(self) -> None:
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            if self.path.is_file() and self.path.stat().st_size > self.max_bytes:
+                rotated = self.path.with_suffix(self.path.suffix + ".1")
+                rotated.unlink(missing_ok=True)
+                self.path.replace(rotated)
+            self.write("=" * 64)
+            self.write(f"{APP_NAME} {APP_VERSION} session started")
+            self.write(
+                f"Platform: {platform.system()} {platform.machine()} • "
+                f"Python {platform.python_version()}"
+            )
+        except OSError:
+            pass
+
+    def write(self, message: str, level: str = "INFO") -> None:
+        timestamp = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+        line = f"[{timestamp}] [{level}] {message.rstrip()}\n"
+        try:
+            with self.lock:
+                with self.path.open("a", encoding="utf-8") as handle:
+                    handle.write(line)
+        except OSError:
+            pass
+
+
+def version_tuple(value: str) -> tuple[int, int, int]:
+    match = re.search(r"(\d+)(?:\.(\d+))?(?:\.(\d+))?", value)
+    if not match:
+        return (0, 0, 0)
+    return tuple(int(part or 0) for part in match.groups())  # type: ignore[return-value]
+
+
+def parse_latest_release(payload: dict, current_version: str = APP_VERSION) -> dict:
+    tag = str(payload.get("tag_name") or "")
+    latest = tag.lstrip("vV")
+    return {
+        "has_update": version_tuple(latest) > version_tuple(current_version),
+        "latest_version": tag or latest,
+        "download_url": str(payload.get("html_url") or ""),
+        "name": str(payload.get("name") or tag or latest),
+    }
+
+
+def fetch_latest_release(timeout: int = 8) -> dict:
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "User-Agent": f"{APP_NAME}/{APP_VERSION}",
+    }
+    request = urllib.request.Request(RELEASE_API_URL, headers=headers)
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        if exc.code != 404:
+            raise
+        tag_request = urllib.request.Request(TAGS_API_URL, headers=headers)
+        with urllib.request.urlopen(tag_request, timeout=timeout) as response:
+            tags = json.loads(response.read().decode("utf-8"))
+        if not isinstance(tags, list) or not tags:
+            raise OSError("No published GitHub release or version tag was found.")
+        tag = str(tags[0].get("name") or "")
+        payload = {
+            "tag_name": tag,
+            "name": tag,
+            "html_url": RELEASES_PAGE_URL,
+        }
+    if not isinstance(payload, dict):
+        raise OSError("GitHub returned an unexpected release response.")
+    return parse_latest_release(payload)
 
 
 @dataclass
@@ -797,37 +910,27 @@ def ensure_managed_key(run_command, log) -> tuple[Path, str, str]:
     return MANAGED_KEYSTORE, alias, password
 
 
-def replace_package_references(decoded: Path, old: str, new: str, log) -> int:
+def replace_package_references_with_report(
+    decoded: Path,
+    old: str,
+    new: str,
+    log,
+) -> dict:
     replacements = 0
-    preserved_matches = []
+    changed_files = []
+    preview = scan_package_references(decoded, old)
     old_bytes = old.encode("utf-8")
     old_slash = old.replace(".", "/").encode("utf-8")
     new_bytes = new.encode("utf-8")
     new_slash = new.replace(".", "/").encode("utf-8")
 
-    for path in decoded.rglob("*"):
-        if not path.is_file() or path.is_symlink():
+    for entry in preview["technical_files"]:
+        path = decoded / entry["path"]
+        if not path.is_file():
             continue
-        relative = path.relative_to(decoded)
-        relative_posix = relative.as_posix()
-        technical_file = (
-            relative_posix in {"AndroidManifest.xml", "apktool.yml"}
-            or path.suffix.lower() == ".smali"
-            or (
-                len(relative.parts) > 1
-                and relative.parts[0] == "res"
-                and path.suffix.lower() == ".xml"
-            )
-        )
         try:
-            if not technical_file and path.stat().st_size > 64 * 1024 * 1024:
-                continue
             data = path.read_bytes()
         except OSError:
-            continue
-        if not technical_file:
-            if old_bytes in data or old_slash in data:
-                preserved_matches.append(relative)
             continue
 
         changed = data.replace(old_bytes, new_bytes)
@@ -835,13 +938,21 @@ def replace_package_references(decoded: Path, old: str, new: str, log) -> int:
             changed = changed.replace(old_slash, new_slash)
         if changed != data:
             path.write_bytes(changed)
-            replacements += data.count(old_bytes) + data.count(old_slash)
+            count = data.count(old_bytes) + data.count(old_slash)
+            replacements += count
+            changed_files.append(
+                {
+                    "path": entry["path"],
+                    "occurrences": count,
+                }
+            )
 
     log(
         f"Updated {replacements:,} package reference(s) in Android technical files."
     )
+    preserved_matches = preview["preserved_files"]
     if preserved_matches:
-        examples = ", ".join(str(path) for path in preserved_matches[:3])
+        examples = ", ".join(entry["path"] for entry in preserved_matches[:3])
         more = (
             f" and {len(preserved_matches) - 3} more"
             if len(preserved_matches) > 3
@@ -852,7 +963,24 @@ def replace_package_references(decoded: Path, old: str, new: str, log) -> int:
             f"data ({examples}{more}). These were deliberately preserved unchanged; "
             "test the game for runtime or entitlement dependencies."
         )
-    return replacements
+    return {
+        **preview,
+        "new_package": new,
+        "changed_occurrences": replacements,
+        "changed_files": changed_files,
+        "preserved_count": len(preserved_matches),
+    }
+
+
+def replace_package_references(decoded: Path, old: str, new: str, log) -> int:
+    return int(
+        replace_package_references_with_report(
+            decoded,
+            old,
+            new,
+            log,
+        )["changed_occurrences"]
+    )
 
 
 def copy_with_progress(source: Path, destination: Path, log, progress=None) -> None:
@@ -985,7 +1113,7 @@ class StatusBadge(Canvas):
         text: str,
         *,
         tone: str = "success",
-        background: str = "#202633",
+        background: str = "#151d2f",
     ) -> None:
         self.badge_font = tkfont.Font(family="Sans", size=9, weight="bold")
         self.badge_text = text
@@ -1044,10 +1172,10 @@ class DeviceStatusCard(Canvas):
     """Rounded, clickable Quest connection card for the app header."""
 
     PALETTES = {
-        "success": ("#153a30", "#6ee7a8", "#b6ddcf"),
-        "error": ("#42212a", "#ff8a9a", "#dfb6bf"),
-        "warning": ("#493b22", "#f4c96b", "#e4d0a0"),
-        "neutral": ("#293143", "#d7dfed", "#9ca9bd"),
+        "success": ("#123a32", "#57e6b1", "#b3dacf"),
+        "error": ("#44212e", "#ff8296", "#dfb3bd"),
+        "warning": ("#49391f", "#f5c76a", "#dfcda2"),
+        "neutral": ("#222d45", "#d7e0ee", "#9aabc3"),
     }
 
     def __init__(self, parent, command) -> None:
@@ -1055,7 +1183,7 @@ class DeviceStatusCard(Canvas):
             parent,
             width=246,
             height=58,
-            bg="#151923",
+            bg="#0b1020",
             bd=0,
             highlightthickness=0,
             cursor="hand2",
@@ -1137,12 +1265,95 @@ class DeviceStatusCard(Canvas):
         )
 
 
+class WorkflowProgress(Canvas):
+    """Compact three-step progress rail for the guided main workflow."""
+
+    LABELS = ("Choose game", "Confirm app ID", "Build & install")
+
+    def __init__(self, parent) -> None:
+        super().__init__(
+            parent,
+            height=58,
+            bg="#0b1020",
+            bd=0,
+            highlightthickness=0,
+            takefocus=0,
+        )
+        self.stage = 1
+        self.completed = 0
+        self.label_font = tkfont.Font(family="Sans", size=8, weight="bold")
+        self.number_font = tkfont.Font(family="Sans", size=8, weight="bold")
+        self.bind("<Configure>", lambda _event: self._draw())
+
+    def set(self, stage: int, completed: int) -> None:
+        self.stage = max(1, min(3, stage))
+        self.completed = max(0, min(3, completed))
+        self._draw()
+
+    def _draw(self) -> None:
+        self.delete("all")
+        width = max(420, self.winfo_width())
+        left = 70
+        right = width - 70
+        points = [
+            left,
+            left + ((right - left) / 2),
+            right,
+        ]
+        node_y = 18
+        for index in range(2):
+            color = "#57e6b1" if index + 1 <= self.completed else "#26334d"
+            self.create_line(
+                points[index] + 13,
+                node_y,
+                points[index + 1] - 13,
+                node_y,
+                fill=color,
+                width=3,
+            )
+        for index, (x, label) in enumerate(zip(points, self.LABELS), start=1):
+            if index <= self.completed:
+                fill = "#153a30"
+                foreground = "#6ee7a8"
+                marker = "✓"
+            elif index == self.stage:
+                fill = "#6f5ef7"
+                foreground = "#ffffff"
+                marker = str(index)
+            else:
+                fill = "#222d45"
+                foreground = "#9aabc3"
+                marker = str(index)
+            self.create_oval(
+                x - 13,
+                node_y - 13,
+                x + 13,
+                node_y + 13,
+                fill=fill,
+                outline=fill,
+            )
+            self.create_text(
+                x,
+                node_y,
+                text=marker,
+                fill=foreground,
+                font=self.number_font,
+            )
+            self.create_text(
+                x,
+                46,
+                text=label,
+                fill="#f8fafc" if index == self.stage else "#9aabc3",
+                font=self.label_font,
+            )
+
+
 class RenamerApp:
     def __init__(self, root: Tk) -> None:
         self.root = root
         self.root.title(f"{APP_NAME} {APP_VERSION}")
-        initial_width = min(900, max(680, self.root.winfo_screenwidth() - 120))
-        initial_height = min(900, max(620, self.root.winfo_screenheight() - 140))
+        initial_width = min(1040, max(680, self.root.winfo_screenwidth() - 120))
+        initial_height = min(980, max(620, self.root.winfo_screenheight() - 100))
         self.root.geometry(f"{initial_width}x{initial_height}")
         self.root.minsize(640, 580)
         icon_path = RESOURCE_DIR / "assets" / "quest-apk-renamer.png"
@@ -1166,6 +1377,15 @@ class RenamerApp:
         self.bulk_paths: list[Path] = []
         self.bulk_tree = None
         self.user_settings = load_user_settings()
+        self.session_logger = SessionLogger(SESSION_LOG_FILE)
+        self.root.report_callback_exception = self._report_callback_exception
+        self.apk_analysis: dict | None = None
+        self.analysis_generation = 0
+        self.analysis_window: Toplevel | None = None
+        self.latest_release: dict | None = None
+        self.update_check_manual = False
+        self.existing_tag_warning: str | None = None
+        self.stack_warning_confirmed_for = ""
 
         self.source_folder_var = StringVar()
         self.apk_var = StringVar()
@@ -1175,6 +1395,9 @@ class RenamerApp:
         self.current_info_var = StringVar(value="Current ID and version will appear here.")
         self.package_status_var = StringVar(
             value="A separate app ID will be suggested for you."
+        )
+        self.analysis_summary_var = StringVar(
+            value="APK analysis starts automatically after you choose a game."
         )
         self.output_summary_var = StringVar(
             value="The save location will be chosen automatically."
@@ -1187,6 +1410,9 @@ class RenamerApp:
         self.sign_var = BooleanVar(value=True)
         self.ask_key_backup_var = BooleanVar(
             value=bool(self.user_settings["ask_signing_key_backup"])
+        )
+        self.check_updates_var = BooleanVar(
+            value=bool(self.user_settings["check_updates"])
         )
         self.replace_source_var = BooleanVar(value=False)
         self.delete_source_after_install_var = BooleanVar(value=False)
@@ -1208,169 +1434,325 @@ class RenamerApp:
         self.root.bind("<Control-q>", lambda _event: self.root.destroy())
         self.root.after(100, self._drain_events)
         self._schedule_device_refresh(250)
+        if self.check_updates_var.get():
+            self.root.after(1400, self.check_for_updates)
 
     def _configure_style(self) -> None:
-        self.root.configure(bg="#151923")
+        self.root.configure(bg="#0b1020")
         style = ttk.Style()
         try:
             style.theme_use("clam")
         except Exception:
             pass
         style.configure(".", font=("Sans", 10))
-        style.configure("TFrame", background="#151923")
-        style.configure("Card.TFrame", background="#202633")
-        style.configure("TLabel", background="#151923", foreground="#dfe7f5")
-        style.configure("Card.TLabel", background="#202633", foreground="#dfe7f5")
+        style.configure("TFrame", background="#0b1020")
+        style.configure(
+            "Card.TFrame",
+            background="#151d2f",
+            borderwidth=1,
+            relief="solid",
+            bordercolor="#26334d",
+        )
+        style.configure(
+            "CardBody.TFrame",
+            background="#151d2f",
+            borderwidth=0,
+            relief="flat",
+        )
+        style.configure(
+            "Inset.TFrame",
+            background="#10182a",
+            borderwidth=1,
+            relief="solid",
+            bordercolor="#26334d",
+        )
+        style.configure("TLabel", background="#0b1020", foreground="#e8eef8")
+        style.configure("Card.TLabel", background="#151d2f", foreground="#e8eef8")
+        style.configure("Inset.TLabel", background="#10182a", foreground="#c9d5e7")
         style.configure(
             "Section.TLabel",
-            background="#202633",
-            foreground="#f7f9fc",
-            font=("Sans", 10, "bold"),
+            background="#151d2f",
+            foreground="#f8fafc",
+            font=("Sans", 12, "bold"),
+        )
+        style.configure(
+            "Step.TLabel",
+            background="#151d2f",
+            foreground="#8b7cff",
+            font=("Sans", 9, "bold"),
         )
         style.configure(
             "Title.TLabel",
-            background="#151923",
-            foreground="#ffffff",
-            font=("Sans", 22, "bold"),
+            background="#0b1020",
+            foreground="#f8fafc",
+            font=("Sans", 26, "bold"),
         )
         style.configure(
-            "Subtitle.TLabel", background="#151923", foreground="#96a3b8"
+            "Subtitle.TLabel",
+            background="#0b1020",
+            foreground="#9aabc3",
+            font=("Sans", 10),
         )
-        style.configure("Hint.TLabel", background="#202633", foreground="#9ca9bd")
+        style.configure("Hint.TLabel", background="#151d2f", foreground="#9aabc3")
+        style.configure(
+            "Body.TLabel",
+            background="#151d2f",
+            foreground="#c9d5e7",
+            font=("Sans", 10),
+        )
+        style.configure(
+            "Status.TLabel",
+            background="#151d2f",
+            foreground="#c9d5e7",
+            font=("Sans", 9),
+        )
         style.configure(
             "InlineSuccess.TLabel",
-            background="#202633",
-            foreground="#6ee7a8",
+            background="#151d2f",
+            foreground="#57e6b1",
             font=("Sans", 9, "bold"),
         )
         style.configure(
             "InlineError.TLabel",
-            background="#202633",
-            foreground="#ff8a9a",
+            background="#151d2f",
+            foreground="#ff8296",
             font=("Sans", 9, "bold"),
         )
         style.configure(
             "InlineHint.TLabel",
-            background="#202633",
-            foreground="#9ca9bd",
+            background="#151d2f",
+            foreground="#9aabc3",
             font=("Sans", 9),
         )
         style.configure(
+            "InlineWarning.TLabel",
+            background="#151d2f",
+            foreground="#f4b860",
+            font=("Sans", 9, "bold"),
+        )
+        style.configure(
             "Success.TLabel",
-            background="#202633",
-            foreground="#6ee7a8",
+            background="#151d2f",
+            foreground="#57e6b1",
             font=("Sans", 10, "bold"),
         )
         style.configure(
             "Accent.TButton",
-            background="#7c5cff",
+            background="#6f5ef7",
             foreground="#ffffff",
+            borderwidth=0,
             padding=(16, 10),
             font=("Sans", 10, "bold"),
         )
-        style.map("Accent.TButton", background=[("active", "#9278ff")])
+        style.map(
+            "Accent.TButton",
+            background=[("active", "#8273ff"), ("disabled", "#343b55")],
+            foreground=[("disabled", "#8791a6")],
+        )
         style.configure(
             "Big.TButton",
-            background="#7c5cff",
+            background="#6f5ef7",
             foreground="#ffffff",
-            padding=(18, 14),
-            font=("Sans", 12, "bold"),
+            borderwidth=0,
+            padding=(18, 13),
+            font=("Sans", 11, "bold"),
         )
-        style.map("Big.TButton", background=[("active", "#9278ff")])
+        style.map(
+            "Big.TButton",
+            background=[("active", "#8273ff"), ("disabled", "#343b55")],
+            foreground=[("disabled", "#8791a6")],
+        )
         style.configure(
-            "TButton", background="#303849", foreground="#f5f7fb", padding=(10, 7)
+            "TButton",
+            background="#26334d",
+            foreground="#f5f7fb",
+            borderwidth=0,
+            padding=(11, 8),
+            font=("Sans", 9),
         )
-        style.map("TButton", background=[("active", "#3b465b")])
+        style.map(
+            "TButton",
+            background=[("active", "#334361"), ("disabled", "#1c2639")],
+            foreground=[("disabled", "#68758c")],
+        )
+        style.configure(
+            "Toolbar.TButton",
+            background="#0b1020",
+            foreground="#9aabc3",
+            borderwidth=0,
+            padding=(8, 5),
+            font=("Sans", 9),
+        )
+        style.map(
+            "Toolbar.TButton",
+            background=[("active", "#172138")],
+            foreground=[("active", "#ffffff"), ("disabled", "#566178")],
+        )
+        style.configure(
+            "Pill.TButton",
+            background="#202b43",
+            foreground="#cbd6e8",
+            borderwidth=0,
+            padding=(10, 6),
+            font=("Sans", 9, "bold"),
+        )
+        style.map(
+            "Pill.TButton",
+            background=[("active", "#4b42a0"), ("disabled", "#151d2f")],
+            foreground=[("active", "#ffffff"), ("disabled", "#58657a")],
+        )
+        style.configure(
+            "Link.TButton",
+            background="#151d2f",
+            foreground="#a99eff",
+            borderwidth=0,
+            padding=(5, 4),
+            font=("Sans", 9, "bold"),
+        )
+        style.map(
+            "Link.TButton",
+            background=[("active", "#151d2f")],
+            foreground=[("active", "#ffffff"), ("disabled", "#566178")],
+        )
         style.configure(
             "TEntry",
-            fieldbackground="#11151e",
+            fieldbackground="#0c1322",
             foreground="#ffffff",
             insertcolor="#ffffff",
-            padding=7,
+            bordercolor="#34425d",
+            lightcolor="#34425d",
+            darkcolor="#34425d",
+            padding=9,
         )
+        style.map("TEntry", bordercolor=[("focus", "#8172ff")])
         style.configure(
-            "TCheckbutton", background="#202633", foreground="#dfe7f5"
+            "TCheckbutton",
+            background="#151d2f",
+            foreground="#d7e0ee",
+            indicatorbackground="#0c1322",
+            indicatorforeground="#8172ff",
+            padding=(0, 2),
         )
         style.map(
             "TCheckbutton",
-            background=[("active", "#202633")],
+            background=[("active", "#151d2f")],
             foreground=[("active", "#ffffff")],
         )
         style.configure(
             "Horizontal.TProgressbar",
-            background="#7c5cff",
-            troughcolor="#11151e",
+            background="#8172ff",
+            troughcolor="#0c1322",
+            borderwidth=0,
+            thickness=8,
         )
         style.configure(
             "Dark.Vertical.TScrollbar",
-            background="#303849",
-            troughcolor="#151923",
-            bordercolor="#151923",
-            arrowcolor="#96a3b8",
-            lightcolor="#303849",
-            darkcolor="#303849",
-            width=10,
+            background="#34425d",
+            troughcolor="#0b1020",
+            bordercolor="#0b1020",
+            arrowcolor="#9aabc3",
+            lightcolor="#34425d",
+            darkcolor="#34425d",
+            width=8,
         )
         style.map(
             "Dark.Vertical.TScrollbar",
-            background=[("active", "#48536a")],
+            background=[("active", "#4b5b79")],
         )
         style.configure(
             "Treeview",
-            background="#11151e",
-            fieldbackground="#11151e",
-            foreground="#dfe7f5",
-            bordercolor="#303849",
-            rowheight=28,
+            background="#0c1322",
+            fieldbackground="#0c1322",
+            foreground="#d7e0ee",
+            bordercolor="#26334d",
+            rowheight=30,
         )
         style.map(
             "Treeview",
-            background=[("selected", "#4e3e91")],
+            background=[("selected", "#4b42a0")],
             foreground=[("selected", "#ffffff")],
         )
         style.configure(
             "Treeview.Heading",
-            background="#303849",
+            background="#26334d",
             foreground="#f7f9fc",
             padding=(8, 7),
             font=("Sans", 9, "bold"),
         )
         style.map(
             "Treeview.Heading",
-            background=[("active", "#3b465b")],
+            background=[("active", "#334361")],
+        )
+        style.configure(
+            "TNotebook",
+            background="#0b1020",
+            borderwidth=0,
+            tabmargins=(0, 8, 0, 0),
+        )
+        style.configure(
+            "TNotebook.Tab",
+            background="#151d2f",
+            foreground="#9aabc3",
+            borderwidth=0,
+            padding=(15, 9),
+            font=("Sans", 9, "bold"),
+        )
+        style.map(
+            "TNotebook.Tab",
+            background=[("selected", "#26334d"), ("active", "#1d2940")],
+            foreground=[("selected", "#ffffff"), ("active", "#ffffff")],
         )
 
     def _build_ui(self) -> None:
         viewport = ttk.Frame(self.root)
         viewport.pack(fill=BOTH, expand=True)
+        viewport.columnconfigure(0, weight=1)
+        viewport.rowconfigure(0, weight=1)
         self.scroll_canvas = Canvas(
             viewport,
-            bg="#151923",
+            bg="#0b1020",
             bd=0,
             highlightthickness=0,
         )
-        scrollbar = ttk.Scrollbar(
+        self.scrollbar = ttk.Scrollbar(
             viewport,
             orient="vertical",
             command=self.scroll_canvas.yview,
             style="Dark.Vertical.TScrollbar",
         )
-        self.scroll_canvas.configure(yscrollcommand=scrollbar.set)
-        scrollbar.pack(side=RIGHT, fill="y")
-        self.scroll_canvas.pack(side=LEFT, fill=BOTH, expand=True)
+        self.scroll_canvas.configure(yscrollcommand=self._on_scroll_position)
+        self.scroll_canvas.grid(row=0, column=0, sticky="nsew")
+        self.scrollbar.grid(row=0, column=1, sticky="ns")
+        self.scrollbar.grid_remove()
 
-        outer = ttk.Frame(self.scroll_canvas, padding=(24, 22, 24, 24))
+        outer = ttk.Frame(self.scroll_canvas, padding=(28, 24, 28, 22))
         self.canvas_window = self.scroll_canvas.create_window(
             (0, 0), window=outer, anchor="nw"
         )
         self.outer = outer
 
         header = ttk.Frame(outer)
-        header.pack(fill=X)
+        header.pack(fill=X, pady=(0, 10))
         header.columnconfigure(0, weight=1)
-        ttk.Label(header, text=APP_NAME, style="Title.TLabel").grid(
-            row=0, column=0, sticky="w"
+        title_group = ttk.Frame(header)
+        title_group.grid(row=0, column=0, rowspan=2, sticky="w")
+        ttk.Label(
+            title_group,
+            text="QUEST DESKTOP UTILITY",
+            foreground="#8172ff",
+            background="#0b1020",
+            font=("Sans", 8, "bold"),
+        ).pack(anchor="w")
+        ttk.Label(title_group, text=APP_NAME, style="Title.TLabel").pack(
+            anchor="w", pady=(2, 0)
         )
+        self.subtitle_label = ttk.Label(
+            title_group,
+            text="A guided way to create and install a separate Quest app.",
+            style="Subtitle.TLabel",
+        )
+        self.subtitle_label.pack(anchor="w", pady=(4, 0))
+
         device_panel = ttk.Frame(header)
         device_panel.grid(row=0, column=1, rowspan=2, sticky="ne")
         self.device_card = DeviceStatusCard(
@@ -1382,47 +1764,73 @@ class RenamerApp:
             device_panel,
             f"v{APP_VERSION}",
             tone="neutral",
-            background="#151923",
+            background="#0b1020",
         ).grid(row=0, column=1, sticky="e")
-        self.subtitle_label = ttk.Label(
-            header,
-            text="Choose a game, change its ID, and the app handles the rest.",
-            style="Subtitle.TLabel",
-        )
-        self.subtitle_label.grid(
-            row=1, column=0, sticky="w", pady=(2, 18), padx=(0, 16)
-        )
 
-        source = ttk.Frame(outer, style="Card.TFrame", padding=16)
-        source.pack(fill=X, pady=(0, 12))
+        self.workflow_progress = WorkflowProgress(outer)
+        self.workflow_progress.pack(fill=X, pady=(0, 14))
+
+        self.update_banner = ttk.Frame(outer, style="Card.TFrame", padding=(14, 10))
+        self.update_banner.columnconfigure(0, weight=1)
+        self.update_banner_var = StringVar(value="")
+        ttk.Label(
+            self.update_banner,
+            textvariable=self.update_banner_var,
+            style="Card.TLabel",
+            font=("Sans", 9, "bold"),
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Button(
+            self.update_banner,
+            text="View release",
+            command=self.open_latest_release,
+        ).grid(row=0, column=1, padx=(12, 4))
+        ttk.Button(
+            self.update_banner,
+            text="Dismiss",
+            style="Toolbar.TButton",
+            command=self.dismiss_update,
+        ).grid(row=0, column=2)
+
+        workflow = ttk.Frame(outer)
+        workflow.pack(fill=X, pady=(0, 12))
+        workflow.columnconfigure(0, weight=1, uniform="workflow")
+        workflow.columnconfigure(1, weight=1, uniform="workflow")
+        self.workflow = workflow
+
+        source = ttk.Frame(workflow, style="Card.TFrame", padding=18)
+        source.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
         self.source_card = source
+        source_top = ttk.Frame(source, style="CardBody.TFrame")
+        source_top.pack(fill=X)
+        ttk.Label(source_top, text="STEP 1", style="Step.TLabel").pack(
+            side=LEFT, anchor="w"
+        )
+        self.source_badge = StatusBadge(source_top, "Waiting", tone="neutral")
+        self.source_badge.pack(side=RIGHT)
         self.source_title_label = ttk.Label(
             source,
-            text="1  PICK A GAME",
+            text="Choose a game bundle",
             style="Section.TLabel",
         )
-        self.source_title_label.pack(
-            anchor="w"
-        )
+        self.source_title_label.pack(anchor="w", pady=(3, 0))
         self.source_help_label = ttk.Label(
             source,
-            text="Choose the main folder. APK and OBB files are found automatically.",
+            text="Pick the main folder. The APK, OBB, and manifest are found for you.",
             style="Hint.TLabel",
         )
-        self.source_help_label.pack(anchor="w", pady=(4, 10))
+        self.source_help_label.pack(anchor="w", pady=(5, 12))
         self.choose_folder_button = ttk.Button(
             source,
-            text="Choose game folder…",
+            text="Choose game folder",
             style="Big.TButton",
             command=self.choose_folder,
         )
         self.choose_folder_button.pack(fill=X)
         self.drop_hint_var = StringVar(
             value=(
-                "Drop a game folder here"
-                "  •  drop several folders for Bulk"
+                "or drop a folder here  •  several folders open Bulk"
                 if DND_AVAILABLE
-                else "Drag-and-drop support is unavailable; use the button above."
+                else "Use the button above to choose a folder."
             )
         )
         self.drop_hint_label = ttk.Label(
@@ -1430,125 +1838,263 @@ class RenamerApp:
             textvariable=self.drop_hint_var,
             style="Hint.TLabel",
         )
-        self.drop_hint_label.pack(anchor="center", pady=(8, 0))
+        self.drop_hint_label.pack(anchor="center", pady=(9, 0))
         self.source_path_label = ttk.Label(
             source,
             textvariable=self.source_folder_var,
             style="Hint.TLabel",
-            wraplength=730,
         )
-        self.source_path_label.pack(anchor="w", pady=(10, 0))
+        self.source_path_label.pack(anchor="w", pady=(12, 0))
         self.detected_label = ttk.Label(
             source,
             textvariable=self.detected_var,
             style="Success.TLabel",
-            wraplength=730,
         )
         self.detected_label.pack(anchor="w", pady=(5, 0))
+        analysis_row = ttk.Frame(source, style="CardBody.TFrame")
+        analysis_row.pack(fill=X, pady=(10, 0))
+        self.analysis_summary_label = ttk.Label(
+            analysis_row,
+            textvariable=self.analysis_summary_var,
+            style="Hint.TLabel",
+            justify=LEFT,
+        )
+        self.analysis_summary_label.pack(anchor="w")
+        self.analysis_button = ttk.Button(
+            analysis_row,
+            text="Open APK analysis",
+            style="Link.TButton",
+            command=self.open_apk_analysis,
+            state="disabled",
+        )
+        self.analysis_button.pack(fill=X, pady=(7, 0))
 
-        settings = ttk.Frame(outer, style="Card.TFrame", padding=16)
-        settings.pack(fill=X, pady=(0, 12))
+        settings = ttk.Frame(workflow, style="Card.TFrame", padding=18)
+        settings.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
         settings.columnconfigure(0, weight=1)
-        ttk.Label(settings, text="2  MAKE IT A NEW APP", style="Section.TLabel").grid(
-            row=0, column=0, sticky="w"
+        self.settings_card = settings
+        settings_top = ttk.Frame(settings, style="CardBody.TFrame")
+        settings_top.grid(row=0, column=0, sticky="ew")
+        ttk.Label(settings_top, text="STEP 2", style="Step.TLabel").pack(
+            side=LEFT, anchor="w"
+        )
+        self.settings_badge = StatusBadge(settings_top, "Waiting", tone="neutral")
+        self.settings_badge.pack(side=RIGHT)
+        ttk.Label(settings, text="Confirm the new app ID", style="Section.TLabel").grid(
+            row=1, column=0, sticky="w", pady=(3, 0)
         )
         self.package_help_label = ttk.Label(
             settings,
-            text="We add “a” for you. Edit it only if you want a different ID.",
+            text="A safe separate ID is suggested. You only need to edit it if you want to.",
             style="Hint.TLabel",
         )
-        self.package_help_label.grid(row=1, column=0, sticky="w", pady=(4, 9))
+        self.package_help_label.grid(row=2, column=0, sticky="w", pady=(5, 12))
         self.new_package_entry = ttk.Entry(
             settings, textvariable=self.new_package_var, font=("Sans", 12)
         )
-        self.new_package_entry.grid(row=2, column=0, sticky="ew")
+        self.new_package_entry.grid(row=3, column=0, sticky="ew")
+        self.new_package_entry.configure(state="disabled")
+        preset_row = ttk.Frame(settings, style="CardBody.TFrame")
+        preset_row.grid(row=4, column=0, sticky="ew", pady=(7, 0))
         ttk.Label(
+            preset_row,
+            text="Quick ID presets",
+            style="Hint.TLabel",
+        ).pack(anchor="w", pady=(0, 3))
+        preset_buttons = ttk.Frame(preset_row, style="CardBody.TFrame")
+        preset_buttons.pack(fill=X)
+        for column in range(5):
+            preset_buttons.columnconfigure(column, weight=1)
+        self.package_preset_buttons = []
+        for column, (label, mode) in enumerate(
+            (
+                ("+a", "suffix:a"),
+                (".dev", "tag:dev"),
+                (".test", "tag:test"),
+                (".qa", "tag:qa"),
+            )
+        ):
+            button = ttk.Button(
+                preset_buttons,
+                text=label,
+                style="Pill.TButton",
+                command=lambda selected=mode: self.apply_package_preset(selected),
+                state="disabled",
+            )
+            button.grid(row=0, column=column, sticky="ew", padx=(0, 3))
+            self.package_preset_buttons.append(button)
+        custom_preset = ttk.Button(
+            preset_buttons,
+            text="Custom…",
+            style="Pill.TButton",
+            command=self.apply_custom_package_tag,
+            state="disabled",
+        )
+        custom_preset.grid(row=0, column=4, sticky="ew")
+        self.package_preset_buttons.append(custom_preset)
+        self.current_info_label = ttk.Label(
             settings,
             textvariable=self.current_info_var,
             style="Hint.TLabel",
-        ).grid(row=3, column=0, sticky="w", pady=(8, 0))
+        )
+        self.current_info_label.grid(row=5, column=0, sticky="w", pady=(10, 0))
         self.package_status_label = ttk.Label(
             settings,
             textvariable=self.package_status_var,
             style="InlineHint.TLabel",
         )
-        self.package_status_label.grid(row=4, column=0, sticky="w", pady=(4, 0))
+        self.package_status_label.grid(row=6, column=0, sticky="w", pady=(5, 0))
 
-        self.output_card = ttk.Frame(outer, style="Card.TFrame", padding=16)
+        self.output_card = ttk.Frame(outer, style="Card.TFrame", padding=18)
         self.output_card.pack(fill=X, pady=(0, 12))
+        output_header = ttk.Frame(self.output_card, style="CardBody.TFrame")
+        output_header.pack(fill=X)
+        output_header.columnconfigure(0, weight=1)
+        output_heading = ttk.Frame(output_header, style="CardBody.TFrame")
+        output_heading.grid(row=0, column=0, sticky="w")
+        ttk.Label(output_heading, text="STEP 3", style="Step.TLabel").pack(anchor="w")
         ttk.Label(
-            self.output_card, text="3  BUILD OR INSTALL", style="Section.TLabel"
-        ).pack(anchor="w")
+            output_heading, text="Create the separate app", style="Section.TLabel"
+        ).pack(anchor="w", pady=(3, 0))
+        self.preflight_badge = StatusBadge(
+            output_header,
+            "Waiting for a game",
+            tone="neutral",
+        )
+        self.preflight_badge.grid(row=0, column=1, sticky="e", padx=(12, 0))
+
+        readiness_row = ttk.Frame(self.output_card, style="CardBody.TFrame")
+        readiness_row.pack(fill=X, pady=(9, 0))
+        self.preflight_label = ttk.Label(
+            readiness_row,
+            textvariable=self.preflight_var,
+            style="Body.TLabel",
+        )
+        self.preflight_label.pack(anchor="w")
+        ttk.Label(
+            readiness_row,
+            text="The app checks everything automatically before the button unlocks.",
+            style="Hint.TLabel",
+        ).pack(anchor="w", pady=(3, 0))
+
+        checks_row = ttk.Frame(self.output_card, style="CardBody.TFrame")
+        checks_row.pack(fill=X, pady=(10, 0))
+        ttk.Label(
+            checks_row,
+            text="AUTOMATIC CHECKS",
+            style="Step.TLabel",
+        ).pack(side=LEFT, padx=(0, 10))
+        self.bundle_check_badge = StatusBadge(
+            checks_row, "Bundle", tone="neutral"
+        )
+        self.bundle_check_badge.pack(side=LEFT, padx=(0, 6))
+        self.tools_check_badge = StatusBadge(
+            checks_row, "Tools", tone="neutral"
+        )
+        self.tools_check_badge.pack(side=LEFT, padx=(0, 6))
+        self.space_check_badge = StatusBadge(
+            checks_row, "Output space", tone="neutral"
+        )
+        self.space_check_badge.pack(side=LEFT)
+
         self.output_summary_label = ttk.Label(
             self.output_card,
             textvariable=self.output_summary_var,
             style="Hint.TLabel",
-            wraplength=730,
         )
-        self.output_summary_label.pack(anchor="w", pady=(5, 10))
-        readiness_row = ttk.Frame(self.output_card, style="Card.TFrame")
-        readiness_row.pack(fill=X, pady=(0, 7))
-        self.preflight_badge = StatusBadge(
-            readiness_row,
-            "Waiting for a game",
-            tone="neutral",
-        )
-        self.preflight_badge.pack(side=LEFT)
-        ttk.Label(
-            readiness_row,
-            text="APK, OBB, manifest, signing, and space are checked automatically.",
-            style="Hint.TLabel",
-        ).pack(side=LEFT, padx=(9, 0))
-        self.preflight_label = ttk.Label(
+        self.output_summary_label.pack(anchor="w", pady=(9, 12))
+
+        self.start_button = ttk.Button(
             self.output_card,
-            textvariable=self.preflight_var,
-            style="Hint.TLabel",
+            text="Create renamed game",
+            style="Big.TButton",
+            command=self.start,
+            state="disabled",
         )
-        self.preflight_label.pack(anchor="w", pady=(0, 11))
-        install_actions = ttk.Frame(self.output_card, style="Card.TFrame")
+        self.start_button.pack(fill=X)
+
+        install_label = ttk.Label(
+            self.output_card,
+            text="INSTALL AN EXISTING FINISHED BUILD",
+            style="Step.TLabel",
+        )
+        install_label.pack(anchor="w", pady=(15, 7))
+        install_actions = ttk.Frame(self.output_card, style="CardBody.TFrame")
         install_actions.pack(fill=X)
         install_actions.columnconfigure(0, weight=1)
         install_actions.columnconfigure(1, weight=1)
         self.install_button = ttk.Button(
             install_actions,
-            text="Install current folder",
+            text="Install finished game",
             command=self.install_on_quest,
             state="disabled",
         )
         self.install_button.grid(row=0, column=0, sticky="ew", padx=(0, 4))
         self.select_install_button = ttk.Button(
             install_actions,
-            text="Select folder to install…",
+            text="Choose another finished folder",
             command=self.choose_install_folder,
         )
         self.select_install_button.grid(row=0, column=1, sticky="ew", padx=(4, 0))
         self.retry_obb_button = ttk.Button(
             self.output_card,
-            text="Retry failed OBB transfer only",
+            text="Retry only the failed OBB files",
             command=self.retry_failed_obbs,
         )
 
-        self.advanced_frame = ttk.Frame(outer, style="Card.TFrame", padding=16)
+        self.progress_row = ttk.Frame(self.output_card, style="CardBody.TFrame")
+        self.progress = ttk.Progressbar(
+            self.progress_row,
+            mode="determinate",
+            maximum=100,
+        )
+        self.progress.pack(side=LEFT, fill=X, expand=True)
+        self.cancel_button = ttk.Button(
+            self.progress_row,
+            text="Cancel safely",
+            command=self.request_cancel,
+            state="disabled",
+        )
+        self.cancel_button.pack(side=RIGHT, padx=(10, 0))
+        ttk.Label(
+            self.progress_row,
+            textvariable=self.progress_percent_var,
+            style="Card.TLabel",
+            font=("Sans", 10, "bold"),
+        ).pack(side=RIGHT, padx=(10, 0))
+        self.status_label = ttk.Label(
+            self.output_card,
+            textvariable=self.status_var,
+            style="Status.TLabel",
+        )
+        self.status_label.pack(anchor="w", pady=(10, 0))
+
+        self.advanced_frame = ttk.Frame(outer, style="Card.TFrame", padding=18)
         self.advanced_frame.columnconfigure(1, weight=1)
         ttk.Label(
-            self.advanced_frame, text="MORE OPTIONS", style="Card.TLabel"
-        ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 8))
+            self.advanced_frame, text="ADVANCED", style="Step.TLabel"
+        ).grid(row=0, column=0, columnspan=3, sticky="w")
+        ttk.Label(
+            self.advanced_frame,
+            text="Output and safety options",
+            style="Section.TLabel",
+        ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(3, 12))
         ttk.Label(
             self.advanced_frame, text="Output folder", style="Card.TLabel"
-        ).grid(row=1, column=0, sticky="w", padx=(0, 8))
+        ).grid(row=2, column=0, sticky="w", padx=(0, 8))
         self.output_entry = ttk.Entry(
             self.advanced_frame, textvariable=self.output_var
         )
         self.output_entry.grid(
-            row=1, column=1, sticky="ew"
+            row=2, column=1, sticky="ew"
         )
         self.output_button = ttk.Button(
             self.advanced_frame, text="Change…", command=self.choose_output
         )
-        self.output_button.grid(row=1, column=2, padx=(8, 0))
-        choices = ttk.Frame(self.advanced_frame, style="Card.TFrame")
+        self.output_button.grid(row=2, column=2, padx=(8, 0))
+        choices = ttk.Frame(self.advanced_frame, style="CardBody.TFrame")
         choices.grid(
-            row=2, column=0, columnspan=3, sticky="ew", pady=(9, 0)
+            row=3, column=0, columnspan=3, sticky="ew", pady=(12, 0)
         )
         choices.columnconfigure(0, weight=1)
         choices.columnconfigure(1, weight=1)
@@ -1591,20 +2137,32 @@ class RenamerApp:
             command=self._invalidate_preflight,
         )
         self.delete_source_check.grid(
-            row=2, column=0, columnspan=2, sticky="w", pady=(4, 0)
+            row=2, column=0, sticky="w", pady=(4, 0)
+        )
+        self.check_updates_check = ttk.Checkbutton(
+            choices,
+            text="Check GitHub for updates",
+            variable=self.check_updates_var,
+            command=self._save_update_setting,
+        )
+        self.check_updates_check.grid(
+            row=2, column=1, sticky="w", pady=(4, 0)
+        )
+        ttk.Separator(self.advanced_frame).grid(
+            row=4, column=0, columnspan=3, sticky="ew", pady=(14, 12)
         )
         self.tools_button = ttk.Button(
             self.advanced_frame,
             text="Repair / verify Android tools",
             command=self.install_tools,
         )
-        self.tools_button.grid(row=3, column=1, sticky="w", pady=(8, 0))
+        self.tools_button.grid(row=5, column=0, sticky="w")
         ttk.Label(
             self.advanced_frame, textvariable=self.tool_var, style="Card.TLabel"
-        ).grid(row=3, column=2, sticky="w", padx=(8, 0), pady=(8, 0))
-        utility_actions = ttk.Frame(self.advanced_frame, style="Card.TFrame")
+        ).grid(row=5, column=1, columnspan=2, sticky="w", padx=(8, 0))
+        utility_actions = ttk.Frame(self.advanced_frame, style="CardBody.TFrame")
         utility_actions.grid(
-            row=4, column=0, columnspan=3, sticky="ew", pady=(12, 0)
+            row=6, column=0, columnspan=3, sticky="ew", pady=(12, 0)
         )
         for column in range(4):
             utility_actions.columnconfigure(column, weight=1)
@@ -1631,73 +2189,69 @@ class RenamerApp:
             command=self.cleanup_output,
         )
         self.cleanup_button.grid(row=0, column=3, sticky="ew", padx=(4, 0))
-        self.start_button = ttk.Button(
-            outer,
-            text="Create renamed game",
-            style="Big.TButton",
-            command=self.start,
-            state="disabled",
+        support_actions = ttk.Frame(self.advanced_frame, style="CardBody.TFrame")
+        support_actions.grid(
+            row=7, column=0, columnspan=3, sticky="ew", pady=(8, 0)
         )
-        self.start_button.pack(fill=X, pady=(0, 10))
-
-        self.progress_row = ttk.Frame(outer)
-        self.progress = ttk.Progressbar(
-            self.progress_row,
-            mode="determinate",
-            maximum=100,
-        )
-        self.progress.pack(side=LEFT, fill=X, expand=True)
-        self.cancel_button = ttk.Button(
-            self.progress_row,
-            text="Cancel safely",
-            command=self.request_cancel,
-            state="disabled",
-        )
-        self.cancel_button.pack(side=RIGHT, padx=(10, 0))
-        ttk.Label(
-            self.progress_row,
-            textvariable=self.progress_percent_var,
-            font=("Sans", 10, "bold"),
-        ).pack(side=RIGHT, padx=(10, 0))
-        self.status_label = ttk.Label(outer, textvariable=self.status_var)
-        self.status_label.pack(anchor="w")
+        for column in range(3):
+            support_actions.columnconfigure(column, weight=1)
+        ttk.Button(
+            support_actions,
+            text="Open debug log",
+            command=self.open_debug_log,
+        ).grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        ttk.Button(
+            support_actions,
+            text="Save log copy…",
+            command=self.save_debug_log,
+        ).grid(row=0, column=1, sticky="ew", padx=4)
+        ttk.Button(
+            support_actions,
+            text="Check for updates",
+            command=lambda: self.check_for_updates(manual=True),
+        ).grid(row=0, column=2, sticky="ew", padx=(4, 0))
 
         self.footer = ttk.Frame(outer)
-        self.footer.pack(fill=X, pady=(10, 0))
+        self.footer.pack(fill=X, pady=(0, 0))
         self.advanced_button = ttk.Button(
-            self.footer, text="More options", command=self.toggle_advanced
+            self.footer,
+            text="Options & tools",
+            style="Toolbar.TButton",
+            command=self.toggle_advanced,
         )
         self.advanced_button.pack(side=LEFT)
         self.bulk_button = ttk.Button(
             self.footer,
-            text="Bulk tools…",
+            text="Bulk tools",
+            style="Toolbar.TButton",
             command=self.open_bulk_tools,
         )
-        self.bulk_button.pack(side=LEFT, padx=(8, 0))
+        self.bulk_button.pack(side=LEFT, padx=(4, 0))
         if sys.platform.startswith("win"):
             launcher_text = (
                 "In Start Menu ✓"
                 if WINDOWS_START_MENU.is_file()
-                else "Add to Start Menu"
+                else "Add app shortcut"
             )
         elif sys.platform == "darwin":
             launcher_text = (
                 "In Applications ✓"
                 if macos_app_is_installed()
-                else "Add to Applications"
+                else "Add app shortcut"
             )
         else:
             launcher_text = (
                 "In Applications ✓"
                 if LINUX_LAUNCHER.is_file()
-                else "Add to Applications"
+                else "Add app shortcut"
             )
         self.launcher_button = ttk.Button(
             self.footer,
             text=launcher_text,
+            style="Toolbar.TButton",
             command=self.install_app_launcher,
         )
-        self.launcher_button.pack(side=LEFT, padx=(8, 0))
+        self.launcher_button.pack(side=LEFT, padx=(4, 0))
         if not (
             sys.platform.startswith("linux")
             or sys.platform.startswith("win")
@@ -1708,20 +2262,24 @@ class RenamerApp:
         ):
             self.launcher_button.configure(state="disabled")
         self.details_button = ttk.Button(
-            self.footer, text="Show details", command=self.toggle_details
+            self.footer,
+            text="Activity log",
+            style="Toolbar.TButton",
+            command=self.toggle_details,
         )
         self.details_button.pack(side=RIGHT)
         ttk.Button(
             self.footer,
             text="About",
+            style="Toolbar.TButton",
             command=self.show_about,
-        ).pack(side=RIGHT, padx=(0, 8))
+        ).pack(side=RIGHT, padx=(0, 4))
 
         self.log = Text(
             outer,
             height=9,
-            bg="#0e121a",
-            fg="#bdc9dc",
+            bg="#080d18",
+            fg="#b8c5d8",
             insertbackground="#ffffff",
             relief="flat",
             padx=10,
@@ -1739,23 +2297,126 @@ class RenamerApp:
         self.root.bind_all("<MouseWheel>", self._on_mousewheel, add="+")
         self.root.bind_all("<Button-4>", self._on_mousewheel, add="+")
         self.root.bind_all("<Button-5>", self._on_mousewheel, add="+")
+        self.source_card.bind("<Configure>", self._on_workflow_card_configure)
+        self.settings_card.bind("<Configure>", self._on_workflow_card_configure)
+        self._refresh_workflow_ui()
+
+    def _on_scroll_position(self, first: str, last: str) -> None:
+        self.scrollbar.set(first, last)
+        # Keep scrolling available without adding a permanent strip beside the
+        # guided workflow. Mouse wheels, touchpads, and keyboard focus continue
+        # to move the canvas normally.
+        self.scrollbar.grid_remove()
 
     def _on_canvas_configure(self, event) -> None:
         self.scroll_canvas.itemconfigure(self.canvas_window, width=event.width)
-        wraplength = max(300, event.width - 90)
+        wide = event.width >= 940
+        if getattr(self, "_workflow_wide", None) != wide:
+            self._workflow_wide = wide
+            self.source_card.grid_forget()
+            self.settings_card.grid_forget()
+            if wide:
+                self.source_card.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+                self.settings_card.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
+            else:
+                self.source_card.grid(row=0, column=0, columnspan=2, sticky="ew")
+                self.settings_card.grid(
+                    row=1,
+                    column=0,
+                    columnspan=2,
+                    sticky="ew",
+                    pady=(12, 0),
+                )
         self.subtitle_label.configure(wraplength=max(240, event.width - 390))
-        for label in (
-            self.source_help_label,
-            self.source_path_label,
-            self.detected_label,
-            self.package_help_label,
-            self.output_summary_label,
-            self.preflight_label,
-        ):
-            label.configure(wraplength=wraplength)
+        content_wrap = max(300, event.width - 92)
+        self.output_summary_label.configure(wraplength=content_wrap)
+        self.preflight_label.configure(wraplength=content_wrap)
+
+    def _on_workflow_card_configure(self, event) -> None:
+        wrap = max(220, event.width - 48)
+        if event.widget == self.source_card:
+            for label in (
+                self.source_help_label,
+                self.source_path_label,
+                self.detected_label,
+                self.analysis_summary_label,
+            ):
+                label.configure(wraplength=wrap)
+        elif event.widget == self.settings_card:
+            for label in (
+                self.package_help_label,
+                self.current_info_label,
+                self.package_status_label,
+            ):
+                label.configure(wraplength=wrap)
+
+    def _refresh_workflow_ui(self) -> None:
+        has_bundle = self.bundle is not None
+        new_package = self.new_package_var.get().strip()
+        old_package = self.old_package_var.get().strip()
+        package_ready = (
+            has_bundle
+            and is_valid_package(new_package)
+            and new_package != old_package
+        )
+        controls_state = "normal" if has_bundle and not self.busy else "disabled"
+        self.new_package_entry.configure(state=controls_state)
+        for button in self.package_preset_buttons:
+            button.configure(state=controls_state)
+        self.choose_folder_button.configure(
+            state="disabled" if self.busy else "normal"
+        )
+        if has_bundle:
+            if not self.source_path_label.winfo_manager():
+                self.source_path_label.pack(
+                    after=self.drop_hint_label,
+                    anchor="w",
+                    pady=(10, 0),
+                )
+            if not self.analysis_button.winfo_manager():
+                self.analysis_button.pack(fill=X, pady=(7, 0))
+        else:
+            self.source_path_label.pack_forget()
+            self.analysis_button.pack_forget()
+
+        self.source_badge.set(
+            "Game loaded" if has_bundle else "Waiting",
+            "success" if has_bundle else "neutral",
+        )
+        if not has_bundle:
+            self.settings_badge.set("Waiting", "neutral")
+        elif package_ready:
+            self.settings_badge.set("ID ready", "success")
+        else:
+            self.settings_badge.set("Fix the ID", "warning")
+
+        tools_ready, _detail = tool_status()
+        self.bundle_check_badge.set(
+            "✓ Bundle" if has_bundle else "Bundle",
+            "success" if has_bundle else "neutral",
+        )
+        self.tools_check_badge.set(
+            "✓ Tools" if tools_ready else "Tools needed",
+            "success" if tools_ready else "warning",
+        )
+        self.space_check_badge.set(
+            "✓ Output space" if self.ready_to_build else "Output space",
+            "success" if self.ready_to_build else "neutral",
+        )
+
+        if self.last_output is not None and self.last_output.is_dir():
+            self.workflow_progress.set(3, 3)
+        elif not has_bundle:
+            self.workflow_progress.set(1, 0)
+        elif not package_ready:
+            self.workflow_progress.set(2, 1)
+        else:
+            self.workflow_progress.set(3, 2)
 
     def _on_content_configure(self, _event=None) -> None:
         self.scroll_canvas.configure(scrollregion=self.scroll_canvas.bbox("all"))
+        first, last = self.scroll_canvas.yview()
+        self._on_scroll_position(str(first), str(last))
 
     def _on_mousewheel(self, event) -> None:
         if event.num == 4:
@@ -1792,7 +2453,7 @@ class RenamerApp:
 
     def _on_drop_leave(self, _event):
         self.drop_hint_var.set(
-            "Drop a game folder here  •  drop several folders for Bulk"
+            "or drop a folder here  •  several folders open Bulk"
         )
         self.drop_hint_label.configure(style="Hint.TLabel")
         return "copy"
@@ -1837,10 +2498,21 @@ class RenamerApp:
         return "copy"
 
     def _append_log(self, message: str) -> None:
+        self.session_logger.write(message)
         self.log.configure(state="normal")
         self.log.insert(END, message.rstrip() + "\n")
         self.log.see(END)
         self.log.configure(state="disabled")
+
+    def _report_callback_exception(self, exc_type, exc_value, exc_traceback) -> None:
+        detail = "".join(
+            traceback.format_exception(exc_type, exc_value, exc_traceback)
+        )
+        self.session_logger.write(detail, level="ERROR")
+        messagebox.showerror(
+            "Unexpected interface error",
+            f"{exc_value}\n\nThe full traceback was saved to:\n{SESSION_LOG_FILE}",
+        )
 
     def _refresh_tool_status(self) -> None:
         ready, detail = tool_status()
@@ -2008,6 +2680,9 @@ class RenamerApp:
         elif not is_valid_package(new_package):
             message = "Use letters, numbers, underscores, and at least one dot."
             style = "InlineError.TLabel"
+        elif self.existing_tag_warning:
+            message = "⚠ " + self.existing_tag_warning
+            style = "InlineWarning.TLabel"
         else:
             message = "✓ Ready to install as a separate app."
             style = "InlineSuccess.TLabel"
@@ -2015,6 +2690,39 @@ class RenamerApp:
         self.package_status_label.configure(style=style)
         self._invalidate_preflight()
         self._update_action_state()
+
+    def apply_package_preset(self, mode: str) -> None:
+        old_package = self.old_package_var.get().strip()
+        if not is_valid_package(old_package):
+            return
+        try:
+            kind, value = mode.split(":", 1)
+            if kind == "suffix":
+                candidate = package_with_suffix(old_package, value)
+            else:
+                candidate = package_with_tag(old_package, value)
+        except (ValueError, UserError) as exc:
+            messagebox.showerror("Could not apply that ID", str(exc))
+            return
+        self.new_package_var.set(candidate)
+        self.new_package_entry.focus_set()
+        self.new_package_entry.icursor(END)
+
+    def apply_custom_package_tag(self) -> None:
+        old_package = self.old_package_var.get().strip()
+        if not is_valid_package(old_package):
+            return
+        tag = simpledialog.askstring(
+            "Custom package tag",
+            "Enter a short technical tag, such as demo, beta, or build2:",
+            parent=self.root,
+        )
+        if tag is None:
+            return
+        try:
+            self.new_package_var.set(package_with_tag(old_package, tag))
+        except ValueError as exc:
+            messagebox.showerror("Invalid package tag", str(exc))
 
     def _invalidate_preflight(self) -> None:
         self.ready_to_build = False
@@ -2065,6 +2773,104 @@ class RenamerApp:
             + ("enabled." if enabled else "disabled.")
         )
 
+    def _save_update_setting(self) -> None:
+        enabled = self.check_updates_var.get()
+        self.user_settings["check_updates"] = enabled
+        try:
+            save_user_settings(self.user_settings)
+        except OSError as exc:
+            messagebox.showerror(
+                "Could not save setting",
+                f"The update preference could not be saved:\n\n{exc}",
+            )
+            return
+        self._append_log(
+            "Automatic GitHub update checks "
+            + ("enabled." if enabled else "disabled.")
+        )
+
+    def check_for_updates(self, manual: bool = False) -> None:
+        self.update_check_manual = self.update_check_manual or manual
+        threading.Thread(target=self._update_check_worker, daemon=True).start()
+
+    def _update_check_worker(self) -> None:
+        try:
+            result = fetch_latest_release()
+        except Exception as exc:
+            self.events.put(("update_error", str(exc)))
+            return
+        self.events.put(("update_result", result))
+
+    def _apply_update_result(self, result: dict) -> None:
+        manual = self.update_check_manual
+        self.update_check_manual = False
+        self.latest_release = result
+        if result.get("has_update"):
+            version = str(result.get("latest_version") or "new version")
+            dismissed = str(self.user_settings.get("dismissed_update") or "")
+            if dismissed != version or manual:
+                self.update_banner_var.set(
+                    f"Update available: {version} — open the release page to download it."
+                )
+                self.update_banner.pack(
+                    before=self.workflow,
+                    fill=X,
+                    pady=(0, 12),
+                )
+                self.root.after_idle(self._on_content_configure)
+            self._append_log(f"GitHub update available: {version}")
+        else:
+            self._append_log("GitHub update check: this version is current.")
+            if manual:
+                messagebox.showinfo(
+                    "No update available",
+                    f"{APP_NAME} {APP_VERSION} is the latest published version.",
+                )
+
+    def open_latest_release(self) -> None:
+        if not self.latest_release:
+            return
+        url = str(self.latest_release.get("download_url") or "")
+        if url:
+            webbrowser.open(url)
+
+    def dismiss_update(self) -> None:
+        if self.latest_release:
+            self.user_settings["dismissed_update"] = str(
+                self.latest_release.get("latest_version") or ""
+            )
+            try:
+                save_user_settings(self.user_settings)
+            except OSError:
+                pass
+        self.update_banner.pack_forget()
+        self.root.after_idle(self._on_content_configure)
+
+    def open_debug_log(self) -> None:
+        if not SESSION_LOG_FILE.is_file():
+            messagebox.showerror("Debug log unavailable", "No debug log was created.")
+            return
+        self._open_path(SESSION_LOG_FILE)
+
+    def save_debug_log(self) -> None:
+        if not SESSION_LOG_FILE.is_file():
+            messagebox.showerror("Debug log unavailable", "No debug log was created.")
+            return
+        selected = filedialog.asksaveasfilename(
+            title="Save a copy of the debug log",
+            initialfile=f"Quest-APK-Renamer-{dt.datetime.now():%Y%m%d-%H%M%S}.log",
+            defaultextension=".log",
+            filetypes=[("Log files", "*.log"), ("Text files", "*.txt")],
+        )
+        if not selected:
+            return
+        try:
+            shutil.copy2(SESSION_LOG_FILE, Path(selected))
+        except OSError as exc:
+            messagebox.showerror("Could not save log", str(exc))
+            return
+        messagebox.showinfo("Debug log saved", f"Saved to:\n\n{selected}")
+
     def choose_folder(self) -> None:
         initial = (
             Path(self.source_folder_var.get()).parent
@@ -2108,6 +2914,15 @@ class RenamerApp:
 
     def _load_bundle(self, bundle: BundleInfo) -> None:
         self.bundle = bundle
+        self.apk_analysis = None
+        self.analysis_generation += 1
+        self.analysis_summary_var.set("Analyzing APK metadata and signing…")
+        self.analysis_button.configure(text="Analyzing APK…", state="disabled")
+        self.existing_tag_warning = detect_existing_tag(
+            bundle.package_name,
+            managed_marker=(bundle.root / "RENAMED-BUNDLE.txt").is_file(),
+        )
+        self.stack_warning_confirmed_for = ""
         self.source_folder_var.set(str(bundle.root))
         self.apk_var.set(str(bundle.apk))
         self.old_package_var.set(bundle.package_name)
@@ -2150,10 +2965,440 @@ class RenamerApp:
         )
         self._append_log(f"Loaded source bundle: {bundle.root}")
         self.status_var.set("Game found — we suggested a new ID and checked the rest")
+        self._start_apk_analysis(bundle)
         self._update_action_state()
+        self._on_package_changed()
         self.new_package_entry.focus_set()
         self.new_package_entry.selection_clear()
         self.new_package_entry.icursor(END)
+
+    def _start_apk_analysis(self, bundle: BundleInfo) -> None:
+        generation = self.analysis_generation
+        threading.Thread(
+            target=self._apk_analysis_worker,
+            args=(generation, bundle.apk),
+            daemon=True,
+        ).start()
+
+    def _apk_analysis_worker(self, generation: int, apk: Path) -> None:
+        try:
+            java = find_java()
+            if not java or not APKTOOL_JAR.is_file():
+                raise UserError("Android analysis tools are unavailable.")
+            analysis = analyze_apk_file(
+                apk,
+                java,
+                APKTOOL_JAR,
+                SIGNER_JAR,
+                SIGNER_REGISTRY_FILE,
+                log=lambda message: self.session_logger.write(
+                    f"APK analysis: {message}"
+                ),
+            )
+        except Exception as exc:
+            self.events.put(
+                (
+                    "analysis_error",
+                    {
+                        "generation": generation,
+                        "apk": str(apk),
+                        "error": str(exc),
+                    },
+                )
+            )
+            return
+        self.events.put(
+            (
+                "analysis_complete",
+                {
+                    "generation": generation,
+                    "apk": str(apk),
+                    "analysis": analysis,
+                },
+            )
+        )
+
+    def _apply_apk_analysis(self, payload: dict) -> None:
+        if (
+            int(payload["generation"]) != self.analysis_generation
+            or self.bundle is None
+            or Path(str(payload["apk"])) != self.bundle.apk
+        ):
+            return
+        analysis = dict(payload["analysis"])
+        self.apk_analysis = analysis
+        package_name = str(analysis.get("package_name") or "")
+        previous_package = self.bundle.package_name
+        if is_valid_package(package_name) and package_name != previous_package:
+            self.bundle.package_name = package_name
+            self.old_package_var.set(package_name)
+            try:
+                self.new_package_var.set(package_with_suffix(package_name, "a"))
+            except UserError:
+                pass
+        version_code = str(analysis.get("version_code") or "")
+        if version_code:
+            self.bundle.version_code = version_code
+            self.version_var.set(version_code)
+        app_label = str(analysis.get("app_label") or "")
+        if app_label and not self.bundle.game_name:
+            self.bundle.game_name = app_label
+
+        signature = analysis.get("signature") or {}
+        identity = signature.get("identity") or {}
+        signer_label = identity.get("label") or (
+            "Unsigned" if not signature.get("signed") else "Unknown signer"
+        )
+        abi_text = ", ".join(analysis.get("abis") or []) or "no native libraries"
+        self.analysis_summary_var.set(
+            f"{signer_label} • {abi_text} • "
+            f"target SDK {analysis.get('target_sdk') or 'unknown'}"
+        )
+        self.analysis_button.configure(text="Open APK analysis", state="normal")
+        self.current_info_var.set(
+            f"Current ID: {self.bundle.package_name or 'not detected'}"
+            f"    •    Version: {self.bundle.version_code or 'not detected'}"
+        )
+        self.existing_tag_warning = detect_existing_tag(
+            self.bundle.package_name,
+            signer_identity=identity,
+            managed_marker=(self.bundle.root / "RENAMED-BUNDLE.txt").is_file(),
+        )
+        self._append_log(
+            "APK analysis complete: "
+            f"{len(analysis.get('permissions') or [])} permissions, "
+            f"{len(analysis.get('abis') or [])} ABI types, signer {signer_label}."
+        )
+        self._on_package_changed()
+
+    def _apply_apk_analysis_error(self, payload: dict) -> None:
+        if int(payload["generation"]) != self.analysis_generation:
+            return
+        error = str(payload["error"])
+        self.analysis_summary_var.set("Analysis unavailable — open Details for the reason.")
+        self.analysis_button.configure(text="APK analysis unavailable", state="disabled")
+        self._append_log(f"APK analysis failed: {error}")
+
+    @staticmethod
+    def _analysis_value(value) -> str:
+        if value is None or value == "":
+            return "Not reported"
+        if isinstance(value, bool):
+            return "Yes" if value else "No"
+        return str(value)
+
+    def _add_analysis_field(
+        self,
+        parent,
+        row: int,
+        label: str,
+        value,
+        *,
+        wrap: int = 620,
+    ) -> None:
+        ttk.Label(parent, text=label, style="Step.TLabel").grid(
+            row=row, column=0, sticky="nw", padx=(0, 14), pady=5
+        )
+        ttk.Label(
+            parent,
+            text=self._analysis_value(value),
+            style="Body.TLabel",
+            wraplength=wrap,
+            justify=LEFT,
+        ).grid(row=row, column=1, sticky="nw", pady=5)
+
+    def open_apk_analysis(self) -> None:
+        if not self.apk_analysis:
+            return
+        if self.analysis_window is not None and self.analysis_window.winfo_exists():
+            self.analysis_window.lift()
+            self.analysis_window.focus_force()
+            return
+
+        analysis = self.apk_analysis
+        window = Toplevel(self.root)
+        self.analysis_window = window
+        window.title("APK analysis")
+        window.geometry("960x860")
+        window.minsize(760, 700)
+        window.configure(bg="#0b1020")
+        window.protocol("WM_DELETE_WINDOW", self._close_analysis_window)
+
+        shell = ttk.Frame(window, padding=(24, 20))
+        shell.pack(fill=BOTH, expand=True)
+        header = ttk.Frame(shell)
+        header.pack(fill=X, pady=(0, 10))
+        heading = ttk.Frame(header)
+        heading.pack(side=LEFT, fill=X, expand=True)
+        ttk.Label(
+            heading,
+            text="APK INSPECTOR",
+            foreground="#8172ff",
+            background="#0b1020",
+            font=("Sans", 8, "bold"),
+        ).pack(anchor="w")
+        ttk.Label(
+            heading,
+            text=str(analysis.get("app_label") or analysis.get("file_name")),
+            style="Title.TLabel",
+        ).pack(anchor="w", pady=(2, 0))
+        ttk.Label(
+            heading,
+            text=str(analysis.get("package_name") or "Package ID unavailable"),
+            style="Subtitle.TLabel",
+        ).pack(anchor="w", pady=(3, 0))
+        signature = analysis.get("signature") or {}
+        identity = signature.get("identity") or {}
+        StatusBadge(
+            header,
+            str(identity.get("label") or ("Signed" if signature.get("signed") else "Unsigned")),
+            tone="success" if signature.get("verified") else "warning",
+            background="#0b1020",
+        ).pack(side=RIGHT)
+
+        summary_strip = ttk.Frame(shell, style="Inset.TFrame", padding=(14, 9))
+        summary_strip.pack(fill=X, pady=(0, 10))
+        abi_count = len(analysis.get("abis") or [])
+        permission_count = len(analysis.get("permissions") or [])
+        certificate_count = len(
+            (analysis.get("signature") or {}).get("certificates") or []
+        )
+        for text in (
+            f"Target SDK {analysis.get('target_sdk') or '?'}",
+            f"{abi_count} CPU architecture" + ("" if abi_count == 1 else "s"),
+            f"{permission_count} permission" + ("" if permission_count == 1 else "s"),
+            f"{certificate_count} signer certificate"
+            + ("" if certificate_count == 1 else "s"),
+        ):
+            StatusBadge(
+                summary_strip,
+                text,
+                tone="neutral",
+                background="#10182a",
+            ).pack(side=LEFT, padx=(0, 7))
+
+        notebook = ttk.Notebook(shell)
+        notebook.pack(fill=BOTH, expand=True)
+
+        overview = ttk.Frame(notebook, style="Card.TFrame", padding=18)
+        overview.columnconfigure(1, weight=1)
+        notebook.add(overview, text="Overview")
+        overview_fields = [
+            ("APK file", analysis.get("file_name")),
+            ("File size", format_size(int(analysis.get("file_size") or 0))),
+            (
+                "Version",
+                f"{analysis.get('version_name') or 'Not reported'} "
+                f"(code {analysis.get('version_code') or 'unknown'})",
+            ),
+            (
+                "Android SDK",
+                f"minimum {analysis.get('min_sdk') or '?'} • "
+                f"target {analysis.get('target_sdk') or '?'} • "
+                f"compiled {analysis.get('compile_sdk') or '?'}",
+            ),
+            ("OpenGL ES", analysis.get("gl_es_version")),
+            ("CPU architectures", ", ".join(analysis.get("abis") or []) or "None detected"),
+            ("Locales", ", ".join(analysis.get("locales") or []) or "Default resources only"),
+            (
+                "APK structure",
+                f"{analysis.get('dex_files') or 0} DEX • "
+                f"{analysis.get('native_libraries') or 0} native libraries • "
+                f"{analysis.get('zip_entries') or 0} ZIP entries",
+            ),
+            (
+                "Components",
+                ", ".join(
+                    f"{name}: {count}"
+                    for name, count in (analysis.get("components") or {}).items()
+                ),
+            ),
+            ("Debuggable build", analysis.get("debuggable")),
+        ]
+        for row, (label, value) in enumerate(overview_fields):
+            self._add_analysis_field(overview, row, label, value)
+        hash_row = len(overview_fields)
+        ttk.Label(overview, text="File hashes", style="Step.TLabel").grid(
+            row=hash_row, column=0, sticky="nw", padx=(0, 14), pady=5
+        )
+        hashes = ttk.Frame(overview, style="CardBody.TFrame")
+        hashes.grid(row=hash_row, column=1, sticky="ew", pady=5)
+        hashes.columnconfigure(1, weight=1)
+        for index, name in enumerate(("md5", "sha1", "sha256")):
+            ttk.Label(
+                hashes, text=name.upper(), style="Hint.TLabel"
+            ).grid(row=index, column=0, sticky="w", padx=(0, 8), pady=2)
+            entry = ttk.Entry(hashes)
+            entry.grid(row=index, column=1, sticky="ew", pady=2)
+            entry.insert(0, str((analysis.get("hashes") or {}).get(name) or ""))
+            entry.configure(state="readonly")
+
+        signing = ttk.Frame(notebook, style="Card.TFrame", padding=18)
+        signing.columnconfigure(1, weight=1)
+        notebook.add(signing, text="Signing")
+        schemes = signature.get("schemes") or {}
+        certs = signature.get("certificates") or []
+        cert = certs[0] if certs else {}
+        certificate_summary = "\n".join(
+            f"#{index}: {item.get('subject') or 'Subject unavailable'}"
+            + (
+                f" • SHA-256 {item.get('sha256')}"
+                if item.get("sha256")
+                else ""
+            )
+            for index, item in enumerate(certs, start=1)
+        )
+        signing_fields = [
+            ("Signature status", "Verified" if signature.get("verified") else "Not verified"),
+            ("Recognized signer", identity.get("full_name") or identity.get("label")),
+            (
+                "Signature schemes",
+                ", ".join(name.upper() for name, enabled in schemes.items() if enabled)
+                or "None detected",
+            ),
+            ("Certificate subject", cert.get("subject")),
+            ("Certificate issuer", cert.get("issuer")),
+            ("Certificate SHA-256", cert.get("sha256")),
+            ("Certificate SHA-1", cert.get("sha1")),
+            ("Signer count", len(certs)),
+            ("All certificates", certificate_summary or "None reported"),
+            (
+                "Build lineage",
+                "The source certificate fingerprints above are copied into the "
+                "renamed bundle report. The output keeps your persistent local "
+                "signing key so future updates remain compatible.",
+            ),
+        ]
+        for row, (label, value) in enumerate(signing_fields):
+            self._add_analysis_field(signing, row, label, value, wrap=600)
+
+        permissions_tab = ttk.Frame(notebook, style="Card.TFrame", padding=14)
+        notebook.add(
+            permissions_tab,
+            text=f"Permissions ({len(analysis.get('permissions') or [])})",
+        )
+        permission_tree = ttk.Treeview(
+            permissions_tab,
+            columns=("kind", "name", "required"),
+            show="headings",
+        )
+        permission_tree.heading("kind", text="Type")
+        permission_tree.heading("name", text="Permission or feature")
+        permission_tree.heading("required", text="Required")
+        permission_tree.column("kind", width=110, stretch=False)
+        permission_tree.column("name", width=560)
+        permission_tree.column("required", width=90, anchor="center", stretch=False)
+        for permission in analysis.get("permissions") or []:
+            permission_tree.insert("", END, values=("Permission", permission, "—"))
+        for feature in analysis.get("features") or []:
+            permission_tree.insert(
+                "",
+                END,
+                values=(
+                    "Feature",
+                    feature.get("name"),
+                    "Yes" if feature.get("required") else "No",
+                ),
+            )
+        permission_tree.pack(fill=BOTH, expand=True)
+
+        rename_tab = ttk.Frame(notebook, style="Card.TFrame", padding=14)
+        notebook.add(rename_tab, text="Rename preview")
+        preview = analysis.get("package_references") or {}
+        ttk.Label(
+            rename_tab,
+            text=(
+                f"{preview.get('technical_occurrences', 0)} technical references "
+                f"across {len(preview.get('technical_files') or [])} files will be updated."
+            ),
+            style="Section.TLabel",
+        ).pack(anchor="w", pady=(0, 5))
+        ttk.Label(
+            rename_tab,
+            text=(
+                f"Target currently selected: {self.new_package_var.get().strip() or 'not selected'}"
+            ),
+            style="Hint.TLabel",
+        ).pack(anchor="w", pady=(0, 10))
+        preview_tree = ttk.Treeview(
+            rename_tab,
+            columns=("action", "path", "count"),
+            show="headings",
+        )
+        preview_tree.heading("action", text="Action")
+        preview_tree.heading("path", text="File")
+        preview_tree.heading("count", text="References")
+        preview_tree.column("action", width=105, stretch=False)
+        preview_tree.column("path", width=590)
+        preview_tree.column("count", width=90, anchor="center", stretch=False)
+        for entry in preview.get("technical_files") or []:
+            preview_tree.insert(
+                "",
+                END,
+                values=("Update", entry["path"], entry["occurrences"]),
+            )
+        for entry in preview.get("preserved_files") or []:
+            preview_tree.insert(
+                "",
+                END,
+                values=("Preserve", entry["path"], entry["occurrences"]),
+            )
+        preview_tree.pack(fill=BOTH, expand=True)
+        if preview.get("native_or_compiled_warnings"):
+            ttk.Label(
+                rename_tab,
+                text=(
+                    "⚠ The old ID also appears in compiled/native data. Those bytes "
+                    "are reported but preserved because rewriting them may corrupt the game."
+                ),
+                style="InlineWarning.TLabel",
+                wraplength=820,
+                justify=LEFT,
+            ).pack(anchor="w", pady=(10, 0))
+
+        actions = ttk.Frame(shell)
+        actions.pack(fill=X, pady=(0, 10), before=notebook)
+        ttk.Button(
+            actions,
+            text="Export analysis…",
+            style="Toolbar.TButton",
+            command=self.export_apk_analysis,
+        ).pack(side=LEFT)
+        ttk.Button(
+            actions,
+            text="Open debug log",
+            style="Toolbar.TButton",
+            command=self.open_debug_log,
+        ).pack(side=LEFT, padx=(6, 0))
+        ttk.Button(
+            actions,
+            text="Close",
+            command=self._close_analysis_window,
+        ).pack(side=RIGHT)
+
+    def _close_analysis_window(self) -> None:
+        if self.analysis_window is not None:
+            self.analysis_window.destroy()
+        self.analysis_window = None
+
+    def export_apk_analysis(self) -> None:
+        if not self.apk_analysis:
+            return
+        package_name = str(self.apk_analysis.get("package_name") or "apk")
+        selected = filedialog.asksaveasfilename(
+            title="Export APK analysis",
+            initialfile=f"{package_name}-analysis.json",
+            defaultextension=".json",
+            filetypes=[("JSON report", "*.json"), ("All files", "*")],
+        )
+        if not selected:
+            return
+        try:
+            write_json_report(Path(selected), self.apk_analysis)
+        except OSError as exc:
+            messagebox.showerror("Could not export analysis", str(exc))
+            return
+        messagebox.showinfo("Analysis exported", f"Saved to:\n\n{selected}")
 
     def _apply_output_mode(self) -> Path:
         assert self.bundle is not None
@@ -2241,28 +3486,46 @@ class RenamerApp:
         window = Toplevel(self.root)
         self.bulk_window = window
         window.title("Bulk rename and install")
-        window.geometry("760x640")
-        window.minsize(660, 560)
-        window.configure(bg="#151923")
+        window.geometry("880x780")
+        window.minsize(720, 680)
+        window.configure(bg="#0b1020")
         window.transient(self.root)
         window.protocol("WM_DELETE_WINDOW", self._close_bulk_tools)
 
-        outer = ttk.Frame(window, padding=18)
+        outer = ttk.Frame(window, padding=(24, 20))
         outer.pack(fill=BOTH, expand=True)
+        header = ttk.Frame(outer)
+        header.pack(fill=X)
+        heading = ttk.Frame(header)
+        heading.pack(side=LEFT, fill=X, expand=True)
         ttk.Label(
-            outer,
+            heading,
+            text="BATCH WORKFLOW",
+            foreground="#8172ff",
+            background="#0b1020",
+            font=("Sans", 8, "bold"),
+        ).pack(anchor="w")
+        ttk.Label(
+            heading,
             text="Bulk rename and install",
             style="Title.TLabel",
-        ).pack(anchor="w")
+        ).pack(anchor="w", pady=(2, 0))
+        self.bulk_count_badge = StatusBadge(
+            header,
+            "0 games",
+            tone="neutral",
+            background="#0b1020",
+        )
+        self.bulk_count_badge.pack(side=RIGHT)
         ttk.Label(
             outer,
             text=(
-                "Pick several APKs at once, add folders, or scan a parent folder. "
-                "The app handles each game one at a time."
+                "Build or install several authorized game bundles in a safe queue. "
+                "Each game finishes before the next one starts."
             ),
             style="Subtitle.TLabel",
-            wraplength=700,
-        ).pack(anchor="w", pady=(3, 12))
+            wraplength=820,
+        ).pack(anchor="w", pady=(5, 14))
 
         columns = ("folder", "current", "new")
         tree = ttk.Treeview(
@@ -2280,12 +3543,21 @@ class RenamerApp:
         tree.column("current", width=205, minwidth=150)
         tree.column("new", width=220, minwidth=160)
         tree.pack(fill=BOTH, expand=True)
+        self.bulk_empty_var = StringVar(
+            value="No games queued yet — add several APKs or scan a parent folder."
+        )
+        ttk.Label(
+            outer,
+            textvariable=self.bulk_empty_var,
+            style="Subtitle.TLabel",
+        ).pack(anchor="w", pady=(7, 0))
 
         list_actions = ttk.Frame(outer)
-        list_actions.pack(fill=X, pady=(8, 12))
+        list_actions.pack(fill=X, pady=(8, 14))
         ttk.Button(
             list_actions,
-            text="Add APKs…",
+            text="Add several APKs…",
+            style="Accent.TButton",
             command=self._bulk_add_apks,
         ).pack(side=LEFT)
         ttk.Button(
@@ -2314,40 +3586,45 @@ class RenamerApp:
         options.columnconfigure(1, weight=1)
         ttk.Label(
             options,
-            text="Package suffix",
+            text="PACKAGE ID RULE",
+            style="Step.TLabel",
+        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
+        ttk.Label(
+            options,
+            text="Add to every package",
             style="Card.TLabel",
-        ).grid(row=0, column=0, sticky="w", padx=(0, 10))
+        ).grid(row=1, column=0, sticky="w", padx=(0, 10))
         ttk.Entry(options, textvariable=self.bulk_suffix_var, width=12).grid(
-            row=0, column=1, sticky="w"
+            row=1, column=1, sticky="w"
         )
         ttk.Label(
             options,
             text="Example: com.example.game + a → com.example.gamea",
             style="Hint.TLabel",
-        ).grid(row=1, column=1, sticky="w", pady=(3, 7))
+        ).grid(row=2, column=1, sticky="w", pady=(3, 8))
         ttk.Checkbutton(
             options,
             text="Replace each source folder only after its build succeeds",
             variable=self.bulk_replace_var,
-        ).grid(row=2, column=1, sticky="w")
+        ).grid(row=3, column=1, sticky="w")
         ttk.Checkbutton(
             options,
             text="Move each local folder to Trash only after its install verifies",
             variable=self.bulk_delete_var,
-        ).grid(row=3, column=1, sticky="w", pady=(3, 0))
+        ).grid(row=4, column=1, sticky="w", pady=(3, 0))
 
         actions = ttk.Frame(outer)
         actions.pack(fill=X, pady=(12, 0))
         self.bulk_rename_button = ttk.Button(
             actions,
-            text="Rename all",
+            text="Build renamed copies",
             style="Accent.TButton",
             command=self.start_bulk_rename,
         )
         self.bulk_rename_button.pack(side=LEFT, fill=X, expand=True, padx=(0, 4))
         self.bulk_install_button = ttk.Button(
             actions,
-            text="Install all",
+            text="Install queued games",
             style="Accent.TButton",
             command=self.start_bulk_install,
         )
@@ -2362,6 +3639,7 @@ class RenamerApp:
             self.bulk_window.destroy()
         self.bulk_window = None
         self.bulk_tree = None
+        self.bulk_count_badge = None
 
     def _add_bulk_path(self, path: Path) -> None:
         path = path.expanduser().resolve()
@@ -2491,6 +3769,21 @@ class RenamerApp:
                 "end",
                 iid=str(index),
                 values=(path.name, current, renamed),
+            )
+        count = len(self.bulk_paths)
+        if hasattr(self, "bulk_count_badge"):
+            self.bulk_count_badge.set(
+                f"{count} game" + ("" if count == 1 else "s"),
+                "success" if count else "neutral",
+            )
+        if hasattr(self, "bulk_empty_var"):
+            self.bulk_empty_var.set(
+                (
+                    f"{count} game" + ("" if count == 1 else "s")
+                    + " queued • runs one at a time"
+                )
+                if count
+                else "No games queued yet — add several APKs or scan a parent folder."
             )
         state = "normal" if self.bulk_paths and not self.busy else "disabled"
         if hasattr(self, "bulk_rename_button"):
@@ -2853,11 +4146,11 @@ class RenamerApp:
             self.advanced_frame.pack(
                 after=self.output_card, fill=X, pady=(0, 12)
             )
-            self.advanced_button.configure(text="Hide options")
+            self.advanced_button.configure(text="Hide options & tools")
             self.root.after_idle(lambda: self.scroll_canvas.yview_moveto(1.0))
         else:
             self.advanced_frame.pack_forget()
-            self.advanced_button.configure(text="More options")
+            self.advanced_button.configure(text="Options & tools")
         self.root.after_idle(self._on_content_configure)
 
     def toggle_details(self) -> None:
@@ -2866,11 +4159,11 @@ class RenamerApp:
             self.log.pack(
                 before=self.footer, fill=X, pady=(10, 0)
             )
-            self.details_button.configure(text="Hide details")
+            self.details_button.configure(text="Hide activity log")
             self.root.after_idle(lambda: self.scroll_canvas.yview_moveto(1.0))
         else:
             self.log.pack_forget()
-            self.details_button.configure(text="Show details")
+            self.details_button.configure(text="Activity log")
         self.root.after_idle(self._on_content_configure)
 
     def install_tools(self) -> None:
@@ -3587,6 +4880,22 @@ class RenamerApp:
     def start(self) -> None:
         if self.busy:
             return
+        warning_key = (
+            f"{self.old_package_var.get().strip()}→"
+            f"{self.new_package_var.get().strip()}"
+        )
+        if (
+            self.existing_tag_warning
+            and self.stack_warning_confirmed_for != warning_key
+        ):
+            if not messagebox.askyesno(
+                "This APK may already be renamed",
+                self.existing_tag_warning
+                + "\n\nRenaming it again can stack another package tag or create "
+                "a second generation of the test build. Continue?",
+            ):
+                return
+            self.stack_warning_confirmed_for = warning_key
         try:
             values = self._perform_preflight()
         except UserError as exc:
@@ -3683,7 +4992,38 @@ class RenamerApp:
                     raise OperationCancelled()
                 progress(26, "APK decoded.")
 
-                replace_package_references(
+                source_analysis = None
+                cached_analysis = self.apk_analysis
+                if (
+                    cached_analysis
+                    and Path(str(cached_analysis.get("file_path") or ""))
+                    == bundle.apk
+                ):
+                    source_analysis = json.loads(json.dumps(cached_analysis))
+                    log("Reused the completed APK analysis for the build report.")
+                else:
+                    try:
+                        source_analysis = inspect_decoded_apk(
+                            bundle.apk,
+                            decoded,
+                            find_java() or "java",
+                            SIGNER_JAR,
+                            SIGNER_REGISTRY_FILE,
+                        )
+                        log("Captured APK metadata and source signing identity.")
+                    except Exception as exc:
+                        log(f"Warning: detailed source analysis was unavailable: {exc}")
+                        source_analysis = {
+                            "file_name": bundle.apk.name,
+                            "file_path": str(bundle.apk),
+                            "file_size": bundle.apk.stat().st_size,
+                            "package_name": old_package,
+                            "version_code": version_code or bundle.version_code,
+                            "hashes": {"sha256": sha256_file(bundle.apk)},
+                            "signature": {"error": str(exc)},
+                        }
+
+                change_report = replace_package_references_with_report(
                     decoded, old_package, new_package, log=log
                 )
                 if self.cancel_event.is_set():
@@ -3758,6 +5098,25 @@ class RenamerApp:
                 log(f"Created {apk_output.name}")
                 progress(73, "APK saved to the output folder.")
 
+                registry = load_signer_registry(SIGNER_REGISTRY_FILE)
+                output_signature = inspect_signature(
+                    apk_output,
+                    find_java() or "java",
+                    SIGNER_JAR,
+                    registry,
+                )
+                if output_signature.get("verified"):
+                    output_identity = output_signature.get("identity") or {}
+                    log(
+                        "Verified output signing identity: "
+                        + str(output_identity.get("label") or "unrecognized signer")
+                    )
+                elif should_sign:
+                    log(
+                        "Warning: output signing details could not be parsed for "
+                        "the report, although the signer command completed."
+                    )
+
                 obb_outputs = []
                 total_obb_bytes = (
                     sum(path.stat().st_size for path in bundle.obbs)
@@ -3816,7 +5175,100 @@ class RenamerApp:
                     obb_outputs=obb_outputs,
                 )
                 log(f"Created {manifest.name}")
-                progress(97, "Manifest updated.")
+                progress(96, "Manifest updated.")
+
+                obb_changes = []
+                for source_obb, output_obb in zip(bundle.obbs, obb_outputs):
+                    obb_changes.append(
+                        {
+                            "source": str(source_obb.relative_to(bundle.root)),
+                            "output": str(output_obb.relative_to(output)),
+                            "size": output_obb.stat().st_size,
+                        }
+                    )
+                report = {
+                    "report_version": 1,
+                    "created_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
+                    "created_by": {
+                        "application": APP_NAME,
+                        "version": APP_VERSION,
+                    },
+                    "packages": {
+                        "source": old_package,
+                        "output": new_package,
+                    },
+                    "source_apk": {
+                        **(source_analysis or {}),
+                        "file_path": bundle.apk.name,
+                    },
+                    "output_apk": {
+                        "file_name": apk_output.name,
+                        "file_size": apk_output.stat().st_size,
+                        "hashes": compute_hashes(apk_output),
+                        "signature": output_signature,
+                    },
+                    "signing_lineage": {
+                        "meaning": (
+                            "Audit metadata only. Android cryptographic signing "
+                            "lineage cannot be recreated without the original private key."
+                        ),
+                        "source": (source_analysis or {}).get("signature"),
+                        "output": output_signature,
+                    },
+                    "package_changes": change_report,
+                    "obb_changes": obb_changes,
+                    "preserved_game_content": True,
+                }
+                json_report = output / "RENAME-REPORT.json"
+                write_json_report(json_report, report)
+                source_identity = (
+                    ((source_analysis or {}).get("signature") or {}).get("identity")
+                    or {}
+                )
+                source_signer = str(
+                    source_identity.get("label") or "Unrecognized or unavailable"
+                )
+                text_report = output / "RENAME-REPORT.txt"
+                text_report.write_text(
+                    "\n".join(
+                        [
+                            f"{APP_NAME} package-change report",
+                            "",
+                            f"Source package: {old_package}",
+                            f"Output package: {new_package}",
+                            f"Source signer: {source_signer}",
+                            "Output signer: "
+                            + str(
+                                (output_signature.get("identity") or {}).get("label")
+                                or ("Unsigned" if not should_sign else "Unrecognized")
+                            ),
+                            "Verified signature schemes: "
+                            + (
+                                ", ".join(
+                                    name.upper()
+                                    for name, enabled in (
+                                        output_signature.get("schemes") or {}
+                                    ).items()
+                                    if enabled
+                                )
+                                or "None reported"
+                            ),
+                            "",
+                            f"Technical references changed: {change_report['changed_occurrences']}",
+                            f"Technical files changed: {len(change_report['changed_files'])}",
+                            f"Non-technical files preserved: {change_report['preserved_count']}",
+                            f"Native/compiled warnings: {len(change_report['native_or_compiled_warnings'])}",
+                            f"OBB files renamed: {len(obb_changes)}",
+                            "",
+                            "See RENAME-REPORT.json for file-by-file changes, APK "
+                            "metadata, hashes, certificates, permissions, and source/output lineage.",
+                        ]
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                log("Created RENAME-REPORT.txt and RENAME-REPORT.json")
+                progress(98, "Debugging and change reports created.")
 
                 summary = output / "RENAMED-BUNDLE.txt"
                 summary.write_text(
@@ -3828,6 +5280,8 @@ class RenamerApp:
                             f"Version code: {version_code or bundle.version_code}",
                             f"APK: {apk_output.name}",
                             f"OBB files: {len(obb_outputs)}",
+                            f"Source signer: {source_signer}",
+                            "Change report: RENAME-REPORT.txt / RENAME-REPORT.json",
                             "Game name and in-game text: unchanged",
                             "Signing: persistent local key"
                             if should_sign
@@ -3993,6 +5447,7 @@ class RenamerApp:
                 text="Cancel safely",
                 state="normal" if cancellable else "disabled",
             )
+            self._refresh_workflow_ui()
         else:
             self.progress_row.pack_forget()
             self.cancel_button.configure(text="Cancel safely", state="disabled")
@@ -4040,6 +5495,7 @@ class RenamerApp:
             else "disabled"
         )
         self.install_button.configure(state=install_state)
+        self._refresh_workflow_ui()
 
     def _forget_removed_local_bundle(self, folder: Path) -> None:
         if self.bundle is None or self.bundle.root != folder:
@@ -4073,11 +5529,28 @@ class RenamerApp:
                     self._set_progress(float(percent), str(message))
                 elif kind == "device_status":
                     self._apply_device_status(payload)
+                elif kind == "analysis_complete":
+                    self._apply_apk_analysis(payload)
+                elif kind == "analysis_error":
+                    self._apply_apk_analysis_error(payload)
+                elif kind == "update_result":
+                    self._apply_update_result(payload)
+                elif kind == "update_error":
+                    manual = self.update_check_manual
+                    self.update_check_manual = False
+                    self._append_log(f"GitHub update check failed: {payload}")
+                    if manual:
+                        messagebox.showwarning(
+                            "Update check failed",
+                            "GitHub could not be reached. You can try again later.\n\n"
+                            f"{payload}",
+                        )
                 elif kind == "done_tools":
                     self._set_busy(False, "Tools are installed and verified.")
                     self._refresh_tool_status()
                     messagebox.showinfo(APP_NAME, "Android tools are ready.")
                 elif kind == "error":
+                    self._append_log(f"ERROR: {payload}")
                     self._set_busy(False, "Stopped with an error.")
                     self._refresh_tool_status()
                     messagebox.showerror(APP_NAME, str(payload))
@@ -4861,7 +6334,18 @@ class RenamerApp:
 
 
 def main() -> int:
-    root = TkinterDnD.Tk() if DND_AVAILABLE and TkinterDnD else Tk()
+    global DND_AVAILABLE
+
+    if DND_AVAILABLE and TkinterDnD:
+        try:
+            root = TkinterDnD.Tk()
+        except (RuntimeError, OSError):
+            # A missing or incompatible native tkdnd library should disable
+            # drag-and-drop, not prevent the entire app from launching.
+            DND_AVAILABLE = False
+            root = Tk()
+    else:
+        root = Tk()
     app = RenamerApp(root)
     if len(sys.argv) > 1:
         candidate = Path(sys.argv[1]).expanduser()

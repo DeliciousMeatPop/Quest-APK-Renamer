@@ -17,22 +17,50 @@ try {
     $HashLines = @()
 
     if ($Force -or -not (Test-Path (Join-Path $JavaDir "bin\java.exe"))) {
-        $JavaArchive = Join-Path $TempDir "temurin-jre.zip"
+        $JavaArchive = Join-Path $TempDir "temurin-jdk.zip"
         $JavaExtract = Join-Path $TempDir "java"
-        $JavaUrl = "https://api.adoptium.net/v3/binary/latest/21/ga/windows/x64/jre/hotspot/normal/eclipse"
-        Write-Host "Downloading Eclipse Temurin JRE 21..."
+        $LinkedJava = Join-Path $TempDir "java-runtime"
+        $JavaUrl = "https://api.adoptium.net/v3/binary/latest/21/ga/windows/x64/jdk/hotspot/normal/eclipse"
+        Write-Host "Downloading Eclipse Temurin JDK 21 to create a smaller runtime..."
         Invoke-WebRequest -UseBasicParsing -Uri $JavaUrl -OutFile $JavaArchive
         Expand-Archive -Path $JavaArchive -DestinationPath $JavaExtract
-        $ExtractedJava = Get-ChildItem -Path $JavaExtract -Directory | Select-Object -First 1
-        if (-not $ExtractedJava) {
-            throw "The Temurin archive did not contain a JRE directory."
+        $ExtractedJdk = Get-ChildItem -Path $JavaExtract -Directory | Select-Object -First 1
+        if (-not $ExtractedJdk) {
+            throw "The Temurin archive did not contain a JDK directory."
+        }
+        $Jlink = Join-Path $ExtractedJdk.FullName "bin\jlink.exe"
+        if (-not (Test-Path $Jlink)) {
+            throw "The Temurin archive did not contain jlink.exe."
+        }
+        & $Jlink `
+            --add-modules "java.base,java.desktop,java.logging" `
+            --strip-debug `
+            --no-header-files `
+            --no-man-pages `
+            --compress=2 `
+            --output $LinkedJava
+        if ($LASTEXITCODE -ne 0) {
+            throw "jlink failed to create the bundled Java runtime."
+        }
+        & (Join-Path $LinkedJava "bin\java.exe") -jar (Join-Path $ProjectDir "tools\apktool.jar") --version
+        if ($LASTEXITCODE -ne 0) {
+            throw "The trimmed Java runtime could not start Apktool."
+        }
+        & (Join-Path $LinkedJava "bin\java.exe") -jar (Join-Path $ProjectDir "tools\uber-apk-signer.jar") --help | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            throw "The trimmed Java runtime could not start the APK signer."
+        }
+        & (Join-Path $LinkedJava "bin\keytool.exe") -help 2>&1 | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            throw "The trimmed Java runtime does not provide a working keytool."
         }
         if (Test-Path $JavaDir) {
             Remove-Item -LiteralPath $JavaDir -Recurse -Force
         }
-        Move-Item -LiteralPath $ExtractedJava.FullName -Destination $JavaDir
-        $HashLines += "Temurin JRE archive SHA256: $((Get-FileHash $JavaArchive -Algorithm SHA256).Hash)"
+        Move-Item -LiteralPath $LinkedJava -Destination $JavaDir
+        $HashLines += "Temurin JDK archive SHA256: $((Get-FileHash $JavaArchive -Algorithm SHA256).Hash)"
         $HashLines += "Temurin source: $JavaUrl"
+        $HashLines += "jlink modules: java.base,java.desktop,java.logging"
     }
     if (-not (Test-Path (Join-Path $JavaDir "bin\keytool.exe"))) {
         throw "The bundled Java runtime does not include keytool.exe, which is required to create signing keys."

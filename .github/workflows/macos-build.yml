@@ -10,8 +10,12 @@ on:
       - "v*"
     paths:
       - "quest_apk_renamer.py"
+      - "apk_analysis.py"
+      - "build_support.py"
+      - "build_hooks/**"
       - "tests/**"
       - "assets/**"
+      - "resources/**"
       - "tools/**"
       - "vendor/**"
       - "macos/**"
@@ -24,7 +28,7 @@ permissions:
   contents: write
 
 env:
-  APP_VERSION: "1.8.0"
+  APP_VERSION: "1.9.0"
 
 jobs:
   macos:

@@ -5,8 +5,12 @@ on:
   pull_request:
     paths:
       - "quest_apk_renamer.py"
+      - "apk_analysis.py"
+      - "build_support.py"
+      - "build_hooks/**"
       - "tests/**"
       - "assets/**"
+      - "resources/**"
       - "tools/**"
       - "vendor/**"
       - "linux/**"
@@ -21,8 +25,12 @@ on:
       - "v*"
     paths:
       - "quest_apk_renamer.py"
+      - "apk_analysis.py"
+      - "build_support.py"
+      - "build_hooks/**"
       - "tests/**"
       - "assets/**"
+      - "resources/**"
       - "tools/**"
       - "vendor/**"
       - "linux/**"
@@ -35,7 +43,7 @@ permissions:
   contents: write
 
 env:
-  APP_VERSION: "1.8.0"
+  APP_VERSION: "1.9.0"
 
 jobs:
   linux:

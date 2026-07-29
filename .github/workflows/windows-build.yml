@@ -10,20 +10,25 @@ on:
       - "v*"
     paths:
       - "quest_apk_renamer.py"
+      - "apk_analysis.py"
+      - "build_support.py"
+      - "build_hooks/**"
       - "tests/**"
       - "assets/**"
+      - "resources/**"
       - "tools/**"
       - "vendor/**"
       - "windows/**"
       - "LICENSE"
       - "THIRD_PARTY_NOTICES.md"
+      - "docs/releases/**"
       - ".github/workflows/windows-build.yml"
 
 permissions:
   contents: write
 
 env:
-  APP_VERSION: "1.8.0"
+  APP_VERSION: "1.9.0"
 
 jobs:
   windows:
@@ -123,6 +128,12 @@ jobs:
               $releaseArgs += "--prerelease"
             }
             & gh @releaseArgs
+            if ($LASTEXITCODE -ne 0) {
+              gh release view $tag *> $null
+              if ($LASTEXITCODE -ne 0) {
+                throw "Could not create or find release $tag."
+              }
+            }
           }
           $portableZip = Get-Item ".\dist\Quest-APK-Renamer-$env:APP_VERSION-Windows-portable.zip"
           $installer = Get-ChildItem ".\dist\installer\*.exe" | Select-Object -First 1

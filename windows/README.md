@@ -4,7 +4,7 @@ The Windows port uses the same Python application and tests as Linux. The
 packaged build includes:
 
 - a windowed `Quest APK Renamer.exe` with no console;
-- Eclipse Temurin JRE 21;
+- a trimmed Java 21 runtime created from Eclipse Temurin;
 - Android SDK Platform-Tools (`adb.exe` and required DLLs);
 - Apktool and Uber APK Signer; and
 - TkinterDnD2 native drag-and-drop support.
@@ -23,7 +23,7 @@ The portable application is created under:
 dist\Quest APK Renamer\
 ```
 
-To also create `Quest-APK-Renamer-1.8.0-Setup.exe`, install Inno Setup 6 and
+To also create `Quest-APK-Renamer-1.9.0-Setup.exe`, install Inno Setup 6 and
 run:
 
 ```powershell
@@ -35,8 +35,9 @@ Tagged GitHub builds also create a portable ZIP and
 [`docs/RELEASING.md`](../docs/RELEASING.md) for the release checklist.
 
 Runtime downloads come from the Eclipse Adoptium API and Google's official
-Platform-Tools URL. `windows\runtime\DEPENDENCY-HASHES.txt` records the
-downloaded archive hashes and resolved versions for each build.
+Platform-Tools URL. The build uses `jlink` to keep only the Java modules the
+two APK tools need. `windows\runtime\DEPENDENCY-HASHES.txt` records the
+downloaded archive hashes, module list, and resolved versions for each build.
 
 The installer is per-user and does not require administrator privileges.
 These development builds are not code-signed, so Windows SmartScreen may show

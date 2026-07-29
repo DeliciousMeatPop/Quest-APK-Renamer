@@ -39,31 +39,38 @@ hash_file="$runtime_dir/DEPENDENCY-HASHES.txt"
 : > "$hash_file"
 
 if [[ "$force" -eq 1 || ! -x "$java_dir/bin/java" || ! -x "$java_dir/bin/keytool" ]]; then
-    java_archive="$temp_dir/temurin-jre.tar.gz"
+    java_archive="$temp_dir/temurin-jdk.tar.gz"
     java_extract="$temp_dir/temurin"
-    java_url="https://api.adoptium.net/v3/binary/latest/21/ga/mac/${adoptium_arch}/jre/hotspot/normal/eclipse"
+    linked_java="$temp_dir/java-runtime"
+    java_url="https://api.adoptium.net/v3/binary/latest/21/ga/mac/${adoptium_arch}/jdk/hotspot/normal/eclipse"
     mkdir -p "$java_extract"
-    echo "Downloading Eclipse Temurin JRE 21 for $machine_arch..."
+    echo "Downloading Eclipse Temurin JDK 21 for a smaller $machine_arch runtime..."
     curl --fail --location --retry 3 "$java_url" --output "$java_archive"
     tar -xzf "$java_archive" -C "$java_extract"
-    java_home="$(find "$java_extract" -type f -path '*/Contents/Home/bin/java' -print -quit)"
-    if [[ -z "$java_home" ]]; then
-        echo "The Temurin archive did not contain Contents/Home/bin/java." >&2
+    jlink_path="$(find "$java_extract" -type f -path '*/Contents/Home/bin/jlink' -print -quit)"
+    if [[ -z "$jlink_path" ]]; then
+        echo "The Temurin archive did not contain Contents/Home/bin/jlink." >&2
         exit 1
     fi
-    java_home="$(dirname "$(dirname "$java_home")")"
-    if [[ ! -x "$java_home/bin/keytool" ]]; then
-        echo "The Temurin runtime does not include keytool." >&2
-        exit 1
-    fi
+    "$jlink_path" \
+        --add-modules java.base,java.desktop,java.logging \
+        --strip-debug \
+        --no-header-files \
+        --no-man-pages \
+        --compress=2 \
+        --output "$linked_java"
+    "$linked_java/bin/java" -jar "$script_dir/../tools/apktool.jar" --version
+    "$linked_java/bin/java" -jar "$script_dir/../tools/uber-apk-signer.jar" --help >/dev/null
+    "$linked_java/bin/keytool" -help >/dev/null 2>&1
     rm -rf "$java_dir"
-    /usr/bin/ditto "$java_home" "$java_dir"
+    /usr/bin/ditto "$linked_java" "$java_dir"
     {
-        echo "Temurin JRE archive SHA256: $(shasum -a 256 "$java_archive" | awk '{print $1}')"
+        echo "Temurin JDK archive SHA256: $(shasum -a 256 "$java_archive" | awk '{print $1}')"
         echo "Temurin source: $java_url"
+        echo "jlink modules: java.base,java.desktop,java.logging"
     } >> "$hash_file"
 else
-    echo "Using existing bundled Java runtime."
+    echo "Using existing bundled Java runtime image."
 fi
 
 if [[ "$force" -eq 1 || ! -x "$platform_tools_dir/adb" ]]; then

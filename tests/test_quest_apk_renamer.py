@@ -6,6 +6,8 @@ from pathlib import Path
 from unittest import mock
 
 import quest_apk_renamer as app
+import apk_analysis as apk_analysis
+from build_support import tkdnd_data_files
 
 
 class RenamerTests(unittest.TestCase):
@@ -31,6 +33,197 @@ class RenamerTests(unittest.TestCase):
         self.assertFalse(app.is_valid_package("onepart"))
         self.assertFalse(app.is_valid_package("com.example.bad-name"))
         self.assertFalse(app.is_valid_package("../not.a.package"))
+
+    def test_package_tag_presets_insert_a_separate_segment(self):
+        self.assertEqual(
+            apk_analysis.package_with_tag("com.example.game", "dev"),
+            "com.dev.example.game",
+        )
+        with self.assertRaisesRegex(ValueError, "start with a letter"):
+            apk_analysis.package_with_tag("com.example.game", "2bad")
+
+    def test_existing_tag_detection_uses_package_signer_and_marker(self):
+        self.assertIn(
+            ".dev",
+            apk_analysis.detect_existing_tag("com.dev.example.game"),
+        )
+        self.assertIn(
+            "already signed",
+            apk_analysis.detect_existing_tag(
+                "com.example.game",
+                signer_identity={"id": "quest_apk_renamer"},
+            ),
+        )
+        self.assertIn(
+            "already created",
+            apk_analysis.detect_existing_tag(
+                "com.example.game",
+                managed_marker=True,
+            ),
+        )
+
+    def test_manifest_analysis_extracts_debugging_metadata(self):
+        manifest = self.tmp_path / "AndroidManifest.xml"
+        manifest.write_text(
+            """<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.example.game"
+    android:versionCode="42"
+    android:versionName="1.2"
+    android:compileSdkVersion="32">
+  <uses-sdk android:minSdkVersion="29" android:targetSdkVersion="32"/>
+  <uses-permission android:name="android.permission.INTERNET"/>
+  <uses-feature android:glEsVersion="0x00030001" android:required="true"/>
+  <application android:label="@string/app_name" android:debuggable="true">
+    <activity android:name=".MainActivity"/>
+    <service android:name=".GameService"/>
+  </application>
+</manifest>
+""",
+            encoding="utf-8",
+        )
+        result = apk_analysis.parse_manifest(
+            manifest,
+            {"app_name": "Example Game"},
+        )
+
+        self.assertEqual(result["package_name"], "com.example.game")
+        self.assertEqual(result["app_label"], "Example Game")
+        self.assertEqual(result["gl_es_version"], "3.1")
+        self.assertEqual(result["permissions"], ["android.permission.INTERNET"])
+        self.assertEqual(result["components"]["activity"], 1)
+        self.assertEqual(result["components"]["service"], 1)
+        self.assertTrue(result["debuggable"])
+
+    def test_signer_output_parses_schemes_fingerprints_and_identity(self):
+        output = """
+Verified using v1 scheme (JAR signing): true
+Verified using v2 scheme (APK Signature Scheme v2): true
+Verified using v3 scheme (APK Signature Scheme v3): false
+Signer #1 certificate DN: CN=Quest APK Renamer, OU=Local Build, O=Local
+Signer #1 certificate issuer: CN=Quest APK Renamer, OU=Local Build, O=Local
+Signer #1 certificate SHA-256 digest: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+Signer #1 certificate SHA-1 digest: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+"""
+        registry = apk_analysis.load_signer_registry(
+            Path(__file__).parents[1] / "resources" / "known-signers.json"
+        )
+        result = apk_analysis.parse_signer_output(output, registry)
+
+        self.assertTrue(result["verified"])
+        self.assertTrue(result["schemes"]["v1"])
+        self.assertTrue(result["schemes"]["v2"])
+        self.assertFalse(result["schemes"]["v3"])
+        self.assertEqual(
+            result["certificates"][0]["sha256"],
+            "a" * 64,
+        )
+        self.assertEqual(result["identity"]["id"], "quest_apk_renamer")
+
+    def test_signer_output_parses_uber_signer_1_3_format(self):
+        output = """
+        - signature verified [v3]
+                Subject: CN=Android Debug, O=Example Studio, C=US
+                SHA256: 35a6503d8441cb4b6f6a80c67ecd3aefeb2dc17ab53cc89e61d5eb33e2876397 / SHA384withRSA
+        """
+        registry = apk_analysis.load_signer_registry(
+            Path(__file__).parents[1] / "resources" / "known-signers.json"
+        )
+
+        result = apk_analysis.parse_signer_output(output, registry)
+
+        self.assertTrue(result["verified"])
+        self.assertTrue(result["schemes"]["v3"])
+        self.assertEqual(result["identity"]["id"], "android_debug")
+        self.assertEqual(
+            result["certificates"][0]["sha256"],
+            "35a6503d8441cb4b6f6a80c67ecd3aefeb2dc17ab53cc89e61d5eb33e2876397",
+        )
+
+    def test_package_reference_scan_separates_changed_and_preserved_files(self):
+        decoded = self.tmp_path / "decoded"
+        (decoded / "smali" / "com" / "example").mkdir(parents=True)
+        (decoded / "assets").mkdir()
+        (decoded / "lib" / "arm64-v8a").mkdir(parents=True)
+        (decoded / "AndroidManifest.xml").write_text(
+            'package="com.example.game"',
+            encoding="utf-8",
+        )
+        (decoded / "smali" / "com" / "example" / "Main.smali").write_text(
+            "Lcom/example/game/Main;",
+            encoding="utf-8",
+        )
+        (decoded / "assets" / "config.json").write_text(
+            '{"package":"com.example.game"}',
+            encoding="utf-8",
+        )
+        (decoded / "lib" / "arm64-v8a" / "libgame.so").write_bytes(
+            b"\x00com.example.game\x00"
+        )
+
+        result = apk_analysis.scan_package_references(
+            decoded,
+            "com.example.game",
+        )
+
+        self.assertEqual(result["technical_occurrences"], 2)
+        self.assertEqual(len(result["technical_files"]), 2)
+        self.assertEqual(len(result["preserved_files"]), 2)
+        self.assertEqual(len(result["native_or_compiled_warnings"]), 1)
+
+    def test_release_update_comparison_handles_v_prefix(self):
+        newer = app.parse_latest_release(
+            {
+                "tag_name": "v1.9.0",
+                "html_url": "https://example.invalid/release",
+            },
+            current_version="1.8.0",
+        )
+        current = app.parse_latest_release(
+            {"tag_name": "v1.8.0"},
+            current_version="1.8.0",
+        )
+
+        self.assertTrue(newer["has_update"])
+        self.assertFalse(current["has_update"])
+
+    def test_tkdnd_packaging_selects_only_the_native_backend(self):
+        package_root = Path(__file__).parents[1] / "vendor" / "tkinterdnd2"
+        data_files = tkdnd_data_files(
+            system="Darwin",
+            machine="arm64",
+            tcl_major=9,
+            package_root=package_root,
+        )
+        self.assertEqual(len(data_files), 1)
+        source, destination = data_files[0]
+        self.assertTrue(source.endswith("osx-arm64-tcl9"))
+        self.assertEqual(destination, "tkinterdnd2/tkdnd/osx-arm64-tcl9")
+
+    def test_custom_tkdnd_hook_does_not_collect_extra_backends(self):
+        hook = Path(__file__).parents[1] / "build_hooks" / "hook-tkinterdnd2.py"
+        contents = hook.read_text(encoding="utf-8")
+        self.assertIn("datas = []", contents)
+        self.assertIn("binaries = []", contents)
+
+    def test_main_falls_back_when_native_drag_and_drop_cannot_load(self):
+        fallback_root = mock.Mock()
+        fallback_root.mainloop.return_value = None
+        dnd_root = mock.Mock()
+        dnd_root.Tk.side_effect = RuntimeError("unsupported tkdnd backend")
+
+        with (
+            mock.patch.object(app, "DND_AVAILABLE", True),
+            mock.patch.object(app, "TkinterDnD", dnd_root),
+            mock.patch.object(app, "Tk", return_value=fallback_root) as fallback,
+            mock.patch.object(app, "RenamerApp"),
+            mock.patch.object(app.sys, "argv", ["quest-apk-renamer"]),
+        ):
+            self.assertEqual(app.main(), 0)
+            self.assertFalse(app.DND_AVAILABLE)
+
+        fallback.assert_called_once_with()
+        fallback_root.mainloop.assert_called_once_with()
 
     def test_bulk_suffix_is_appended_to_each_package(self):
         self.assertEqual(
@@ -397,6 +590,7 @@ class RenamerTests(unittest.TestCase):
             "main-window.png",
             "advanced-options.png",
             "bulk-tools.png",
+            "apk-analysis.png",
         ):
             with self.subTest(screenshot=name):
                 content = (project_root / "docs" / "screenshots" / name).read_bytes()

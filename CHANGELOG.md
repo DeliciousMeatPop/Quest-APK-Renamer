@@ -2,6 +2,43 @@
 
 All notable changes to Quest APK Renamer are recorded here.
 
+## Unreleased
+
+## [1.9.0] - 2026-07-29
+
+### Added
+
+- Background APK analysis for labels, SDK levels, OpenGL ES, ABIs, locales,
+  components, permissions, features, and MD5/SHA-1/SHA-256 hashes.
+- V1/V2/V3 signature verification, certificate details, and a reviewable
+  known-signer registry.
+- Full technical package-reference previews with preserved asset/native-code
+  warnings.
+- Human-readable and JSON package-change reports with source/output signing
+  provenance in every completed bundle.
+- Quick package-ID suffix/tag presets and already-renamed warnings.
+- GitHub release/tag update checks with a dismissible update banner.
+- A rotating persistent debug log with open and export actions.
+
+### Changed
+
+- Redesigned the main window into a responsive, guided three-step workspace.
+- Added a live workflow rail, per-step status badges, automatic-check pills,
+  and clearer locked/ready states.
+- Improved narrow-window card stacking and removed clipped helper text.
+- Polished the APK inspector, bulk queue, options view, and action labels into
+  one consistent visual system.
+- Replaced the README screenshots and added a concise feature overview.
+- Kept scrolling available without showing a permanent scrollbar and
+  simplified main-window actions.
+- Rewrote the README around the beginner workflow and shorter reference
+  sections.
+- Reduced release size with a `jlink` Java runtime built from three required
+  root modules.
+- Package only the native tkdnd backend required by each release target.
+- Fall back to the standard folder picker if the native drag-and-drop backend
+  cannot load, instead of preventing the app from launching.
+
 ## [1.8.0] - 2026-07-29
 
 ### Added
@@ -75,4 +112,5 @@ All notable changes to Quest APK Renamer are recorded here.
 - Cleanup refuses folders without the managed-output marker.
 
 [1.7.0]: ../../releases/tag/v1.7.0
-[1.8.0]: ../../releases/tag/v1.8.0
+[1.8.0]: ../../releases/tag/v1.8.0-beta.1
+[1.9.0]: ../../releases/tag/v1.9.0-beta.1

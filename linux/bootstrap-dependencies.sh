@@ -31,31 +31,38 @@ hash_file="$runtime_dir/DEPENDENCY-HASHES.txt"
 : > "$hash_file"
 
 if [[ "$force" -eq 1 || ! -x "$java_dir/bin/java" || ! -x "$java_dir/bin/keytool" ]]; then
-    java_archive="$temp_dir/temurin-jre.tar.gz"
+    java_archive="$temp_dir/temurin-jdk.tar.gz"
     java_extract="$temp_dir/temurin"
-    java_url="https://api.adoptium.net/v3/binary/latest/21/ga/linux/x64/jre/hotspot/normal/eclipse"
+    linked_java="$temp_dir/java-runtime"
+    java_url="https://api.adoptium.net/v3/binary/latest/21/ga/linux/x64/jdk/hotspot/normal/eclipse"
     mkdir -p "$java_extract"
-    echo "Downloading Eclipse Temurin JRE 21..."
+    echo "Downloading Eclipse Temurin JDK 21 to create a smaller runtime..."
     curl --fail --location --retry 3 "$java_url" --output "$java_archive"
     tar -xzf "$java_archive" -C "$java_extract"
-    extracted_java="$(find "$java_extract" -type f -path '*/bin/java' -print -quit)"
-    if [[ -z "$extracted_java" ]]; then
-        echo "The Temurin archive did not contain bin/java." >&2
+    extracted_jlink="$(find "$java_extract" -type f -path '*/bin/jlink' -print -quit)"
+    if [[ -z "$extracted_jlink" ]]; then
+        echo "The Temurin archive did not contain bin/jlink." >&2
         exit 1
     fi
-    extracted_java="$(dirname "$(dirname "$extracted_java")")"
-    if [[ ! -x "$extracted_java/bin/keytool" ]]; then
-        echo "The Temurin runtime does not include keytool." >&2
-        exit 1
-    fi
+    "$extracted_jlink" \
+        --add-modules java.base,java.desktop,java.logging \
+        --strip-debug \
+        --no-header-files \
+        --no-man-pages \
+        --compress=2 \
+        --output "$linked_java"
+    "$linked_java/bin/java" -jar "$script_dir/../tools/apktool.jar" --version
+    "$linked_java/bin/java" -jar "$script_dir/../tools/uber-apk-signer.jar" --help >/dev/null
+    "$linked_java/bin/keytool" -help >/dev/null 2>&1
     rm -rf "$java_dir"
-    cp -a "$extracted_java" "$java_dir"
+    mv "$linked_java" "$java_dir"
     {
-        echo "Temurin JRE archive SHA256: $(sha256sum "$java_archive" | awk '{print $1}')"
+        echo "Temurin JDK archive SHA256: $(sha256sum "$java_archive" | awk '{print $1}')"
         echo "Temurin source: $java_url"
+        echo "jlink modules: java.base,java.desktop,java.logging"
     } >> "$hash_file"
 else
-    echo "Using existing bundled Java runtime."
+    echo "Using existing bundled Java runtime image."
 fi
 
 if [[ "$force" -eq 1 || ! -x "$platform_tools_dir/adb" ]]; then

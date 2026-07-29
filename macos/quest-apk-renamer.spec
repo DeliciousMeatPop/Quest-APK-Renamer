@@ -3,7 +3,7 @@
 import os
 from pathlib import Path
 
-from PyInstaller.utils.hooks import collect_data_files
+from build_support import tkdnd_data_files
 
 
 project_dir = Path(SPECPATH).parent
@@ -13,6 +13,7 @@ codesign_identity = os.environ.get("MACOS_CODESIGN_IDENTITY") or None
 
 datas = [
     (str(project_dir / "assets"), "assets"),
+    (str(project_dir / "resources"), "resources"),
     (str(project_dir / "tools"), "tools"),
     (str(project_dir / "LICENSE"), "."),
     (str(project_dir / "THIRD_PARTY_NOTICES.md"), "."),
@@ -25,7 +26,7 @@ datas = [
 dependency_manifest = macos_dir / "runtime" / "DEPENDENCY-HASHES.txt"
 if dependency_manifest.is_file():
     datas.append((str(dependency_manifest), "runtime"))
-datas += collect_data_files("tkinterdnd2")
+datas += tkdnd_data_files()
 
 a = Analysis(
     [str(project_dir / "quest_apk_renamer.py")],
@@ -33,7 +34,7 @@ a = Analysis(
     binaries=[],
     datas=datas,
     hiddenimports=["tkinterdnd2"],
-    hookspath=[],
+    hookspath=[str(project_dir / "build_hooks")],
     hooksconfig={},
     runtime_hooks=[],
     excludes=[],
@@ -73,12 +74,12 @@ app = BUNDLE(
     name="Quest APK Renamer.app",
     icon=str(macos_dir / "runtime" / "quest-apk-renamer.icns"),
     bundle_identifier="io.github.questapkrenamer.app",
-    version="1.8.0",
+    version="1.9.0",
     info_plist={
         "CFBundleDisplayName": "Quest APK Renamer",
         "CFBundleName": "Quest APK Renamer",
-        "CFBundleShortVersionString": "1.8.0",
-        "CFBundleVersion": "1.8.0",
+        "CFBundleShortVersionString": "1.9.0",
+        "CFBundleVersion": "1.9.0",
         "LSApplicationCategoryType": "public.app-category.utilities",
         "LSMinimumSystemVersion": "12.0",
         "NSHighResolutionCapable": True,

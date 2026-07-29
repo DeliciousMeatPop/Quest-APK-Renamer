@@ -4,7 +4,7 @@ The macOS port uses the same Python application and test suite as Linux and
 Windows. Each packaged build contains:
 
 - a native `Quest APK Renamer.app`;
-- Eclipse Temurin JRE 21 with `keytool`;
+- a trimmed Java 21 runtime with `keytool`, created from Eclipse Temurin;
 - Android SDK Platform-Tools;
 - Apktool and Uber APK Signer; and
 - native Finder drag-and-drop through TkinterDnD2/tkdnd.
@@ -21,9 +21,10 @@ chmod +x macos/build.sh macos/bootstrap-dependencies.sh
 ./macos/build.sh
 ```
 
-The script downloads and records the bundled runtime dependencies, runs the
-test suite, creates the `.app`, applies ad-hoc signing, verifies the bundle,
-and creates the architecture-specific DMG under `dist/`.
+The script downloads and records the bundled runtime dependencies, uses
+`jlink` to keep only the required Java modules, runs the test suite, creates
+the `.app`, applies ad-hoc signing, verifies the bundle, and creates the
+architecture-specific DMG under `dist/`.
 
 To use a Developer ID certificate:
 
