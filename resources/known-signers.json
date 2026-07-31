@@ -1,5 +1,5 @@
 {
-  "_comment": "Recognition uses only certificate CN and O fields. Add entries from trusted development environments as needed.",
+  "_comment": "Recognition matches certificate CN and O fields only (OU and L are deliberately ignored so user signature text and embedded lineage never cause false positives). More specific entries are listed first; the first match wins. Add entries from trusted development environments as needed.",
   "signers": [
     {
       "id": "quest_apk_renamer",
@@ -7,6 +7,34 @@
       "full_name": "Quest APK Renamer local signing key",
       "color": "#8172ff",
       "dn_contains": ["CN=Quest APK Renamer"]
+    },
+    {
+      "id": "automagic",
+      "label": "APC",
+      "full_name": "Automagic Package Changer",
+      "color": "#ff8ac2",
+      "dn_contains": ["Automagic Package Changer"]
+    },
+    {
+      "id": "vrp",
+      "label": "VRP",
+      "full_name": "NotQuestUnderground (VR Pirates)",
+      "color": "#ff6b6b",
+      "dn_contains": ["NotQuestUnderground"]
+    },
+    {
+      "id": "nif",
+      "label": "NIF",
+      "full_name": "NothingIsFree",
+      "color": "#ffd166",
+      "dn_contains": ["NothingIsFree"]
+    },
+    {
+      "id": "vrsrc",
+      "label": "vrSrc",
+      "full_name": "vrSrc (JF)",
+      "color": "#06d6a0",
+      "dn_contains": ["CN=JF"]
     },
     {
       "id": "meta",

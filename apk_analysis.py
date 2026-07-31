@@ -232,6 +232,75 @@ def identify_signer(certificate: dict, registry: list[dict]) -> dict:
     }
 
 
+# Characters that would terminate or corrupt a keytool ``-dname`` relative
+# distinguished name if they appeared inside a value.
+_DN_RESERVED = ',"\\=<>;+'
+DN_VALUE_MAX_LENGTH = 200
+
+
+def sanitize_dn_value(value: str | None, max_length: int = DN_VALUE_MAX_LENGTH) -> str:
+    """Strip characters that break a ``-dname`` RDN and cap the length."""
+    if not value:
+        return ""
+    cleaned = "".join(char for char in str(value) if char not in _DN_RESERVED)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned[:max_length].strip()
+
+
+def describe_previous_signer(identity: dict | None) -> tuple[str, str] | None:
+    """Return ``(full_name, label)`` for a recognized previous signer.
+
+    Returns ``None`` when the source APK was unsigned or signed by an
+    unrecognized certificate, so callers can fall back to ``Fresh rename``.
+    """
+    if not identity:
+        return None
+    if identity.get("id") in (None, "", "unknown"):
+        return None
+    full_name = identity.get("full_name") or identity.get("label")
+    if not full_name:
+        return None
+    label = identity.get("label") or full_name
+    return str(full_name), str(label)
+
+
+def build_lineage_dn(
+    *,
+    signer_name: str = "Quest APK Renamer",
+    signature_text: str = "Renamed build",
+    short_code: str = "QAR",
+    previous: tuple[str, str] | None = None,
+) -> str:
+    """Build the keystore Distinguished Name that embeds signing lineage.
+
+    The previous signer's human-readable identity is baked into the ``L``
+    (locality) field so provenance travels inside the signed APK itself,
+    not only in the side-car report.
+    """
+    common_name = sanitize_dn_value(signer_name) or "Quest APK Renamer"
+    organizational_unit = sanitize_dn_value(signature_text) or "Renamed build"
+    organization = sanitize_dn_value(short_code) or "QAR"
+    if previous:
+        full_name = sanitize_dn_value(previous[0])
+        label = sanitize_dn_value(previous[1])
+        if full_name and label and label.lower() != full_name.lower():
+            locality = sanitize_dn_value(
+                f"Previously signed by {full_name} ({label})"
+            )
+        elif full_name:
+            locality = sanitize_dn_value(f"Previously signed by {full_name}")
+        else:
+            locality = "Fresh rename"
+    else:
+        locality = "Fresh rename"
+    return (
+        f"CN={common_name}, "
+        f"OU={organizational_unit}, "
+        f"O={organization}, "
+        f"L={locality}"
+    )
+
+
 def _digest(patterns: list[str], text: str) -> str | None:
     for pattern in patterns:
         match = re.search(pattern, text, re.IGNORECASE)
