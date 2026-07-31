@@ -10,16 +10,16 @@ body:
         Do not upload APKs, OBBs, signing keys, paid game data, headset serials,
         or logs containing private paths.
   - type: dropdown
-    id: desktop-platform
+    id: operating-system
     attributes:
-      label: Desktop platform
+      label: Operating system
       options:
         - Windows 11
         - Windows 10
         - macOS (Apple Silicon)
         - macOS (Intel)
         - Linux x86_64
-        - Other
+        - Other / not sure
     validations:
       required: true
   - type: dropdown
@@ -36,11 +36,16 @@ body:
         - Other
     validations:
       required: true
-  - type: input
+  - type: dropdown
     id: version
     attributes:
       label: App version
-      placeholder: "1.8.0"
+      description: Choose the closest match shown in the app's title bar or About screen.
+      options:
+        - 1.9.0 (beta 1)
+        - 1.8.0 (beta 1)
+        - Development/source build
+        - Other / not sure
     validations:
       required: true
   - type: input
