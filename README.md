@@ -26,6 +26,10 @@
 > Only modify software you own or have permission to use. Renaming a package
 > does not bypass licensing, entitlement, anti-tamper, or online checks.
 
+> [!WARNING]
+> This app was created entirely with AI and may contain bugs. Keep backups of
+> your original game folders and signing keys.
+
 ![Quest APK Renamer main window](docs/screenshots/main-window.png)
 
 ## What it does
