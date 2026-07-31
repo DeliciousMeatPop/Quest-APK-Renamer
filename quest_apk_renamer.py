@@ -106,14 +106,22 @@ LEGACY_LOADER_SOURCE_URL = (
     f"{LEGACY_LOADER_NAME}"
 )
 RELEASE_API_URL = (
-    "https://api.github.com/repos/RockoTheeHut/Quest-APK-Renamer/releases/latest"
+    "https://api.github.com/repos/RockoTheeHut/Quest-APK-Renamer/releases?per_page=30"
 )
 TAGS_API_URL = (
-    "https://api.github.com/repos/RockoTheeHut/Quest-APK-Renamer/tags?per_page=1"
+    "https://api.github.com/repos/RockoTheeHut/Quest-APK-Renamer/tags?per_page=100"
 )
 RELEASES_PAGE_URL = (
     "https://github.com/RockoTheeHut/Quest-APK-Renamer/releases"
 )
+
+# Versions 1.8 and 1.9 were published before the project adopted its current
+# version sequence. Keep their tags working without treating them as newer
+# than the renamed 1.1 and 1.2 releases.
+LEGACY_RELEASE_VERSIONS = {
+    (1, 8, 0): (1, 1, 0),
+    (1, 9, 0): (1, 2, 0),
+}
 
 
 def platform_app_data() -> Path:
@@ -250,15 +258,37 @@ def version_tuple(value: str) -> tuple[int, int, int]:
     return tuple(int(part or 0) for part in match.groups())  # type: ignore[return-value]
 
 
+def release_version_tuple(value: str) -> tuple[int, int, int]:
+    version = version_tuple(value)
+    return LEGACY_RELEASE_VERSIONS.get(version, version)
+
+
 def parse_latest_release(payload: dict, current_version: str = APP_VERSION) -> dict:
     tag = str(payload.get("tag_name") or "")
     latest = tag.lstrip("vV")
     return {
-        "has_update": version_tuple(latest) > version_tuple(current_version),
+        "has_update": release_version_tuple(latest)
+        > release_version_tuple(current_version),
         "latest_version": tag or latest,
         "download_url": str(payload.get("html_url") or ""),
         "name": str(payload.get("name") or tag or latest),
     }
+
+
+def select_latest_release(payloads: list[dict]) -> dict:
+    published = [
+        payload
+        for payload in payloads
+        if isinstance(payload, dict) and not payload.get("draft")
+    ]
+    if not published:
+        raise OSError("No published GitHub release or version tag was found.")
+    return max(
+        published,
+        key=lambda payload: release_version_tuple(
+            str(payload.get("tag_name") or payload.get("name") or "")
+        ),
+    )
 
 
 def fetch_latest_release(timeout: int = 8) -> dict:
@@ -269,16 +299,23 @@ def fetch_latest_release(timeout: int = 8) -> dict:
     request = urllib.request.Request(RELEASE_API_URL, headers=headers)
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        if exc.code != 404:
-            raise
+            releases = json.loads(response.read().decode("utf-8"))
+        if not isinstance(releases, list):
+            raise OSError("GitHub returned an unexpected release response.")
+        payload = select_latest_release(releases)
+    except (urllib.error.HTTPError, OSError):
         tag_request = urllib.request.Request(TAGS_API_URL, headers=headers)
         with urllib.request.urlopen(tag_request, timeout=timeout) as response:
             tags = json.loads(response.read().decode("utf-8"))
         if not isinstance(tags, list) or not tags:
             raise OSError("No published GitHub release or version tag was found.")
-        tag = str(tags[0].get("name") or "")
+        tag = str(
+            max(
+                tags,
+                key=lambda item: release_version_tuple(str(item.get("name") or "")),
+            ).get("name")
+            or ""
+        )
         payload = {
             "tag_name": tag,
             "name": tag,

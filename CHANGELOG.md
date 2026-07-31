@@ -4,6 +4,11 @@ All notable changes to Quest APK Renamer are recorded here.
 
 ## Unreleased
 
+### Fixed
+
+- Prevented legacy `v1.8` and `v1.9` tags from appearing as updates to the
+  renumbered v1.3 release, and included published prereleases in update checks.
+
 ## [1.3.0] - 2026-07-31
 
 ### Added

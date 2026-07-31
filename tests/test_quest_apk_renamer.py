@@ -248,6 +248,30 @@ Signer #1 certificate SHA-1 digest: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
         self.assertTrue(newer["has_update"])
         self.assertFalse(current["has_update"])
 
+    def test_legacy_release_tags_use_the_renumbered_versions(self):
+        legacy_19 = app.parse_latest_release(
+            {"tag_name": "v1.9.0-beta.1"},
+            current_version="1.3.0",
+        )
+        legacy_18 = app.parse_latest_release(
+            {"tag_name": "v1.8.0-beta.1"},
+            current_version="1.2.0",
+        )
+
+        self.assertFalse(legacy_19["has_update"])
+        self.assertFalse(legacy_18["has_update"])
+
+    def test_latest_release_selection_includes_prereleases(self):
+        latest = app.select_latest_release(
+            [
+                {"tag_name": "v1.9.0-beta.1", "prerelease": True},
+                {"tag_name": "v1.3.0-beta.1", "prerelease": True},
+                {"tag_name": "v1.8.0-beta.1", "prerelease": True},
+            ]
+        )
+
+        self.assertEqual(latest["tag_name"], "v1.3.0-beta.1")
+
     def test_tkdnd_packaging_selects_only_the_native_backend(self):
         package_root = Path(__file__).parents[1] / "vendor" / "tkinterdnd2"
         data_files = tkdnd_data_files(
