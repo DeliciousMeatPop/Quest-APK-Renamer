@@ -67,9 +67,5 @@ chmod +x "$package_dir/Quest APK Renamer" \
 
 rm -f "$archive_path"
 tar -czf "$archive_path" -C "$project_dir/dist" "$package_name"
-(
-    cd "$project_dir/dist"
-    sha256sum "$(basename "$archive_path")" > SHA256SUMS-Linux-x86_64.txt
-)
 
 echo "Linux package created: $archive_path"

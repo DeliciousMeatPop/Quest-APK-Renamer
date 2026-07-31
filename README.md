@@ -65,8 +65,9 @@ package for your computer:
 On Linux, extract the archive and run `./install.sh`.
 
 Windows builds are not currently code-signed, and macOS builds are not
-notarized, so your system may show an unknown-developer warning. You can verify
-your download against the matching `SHA256SUMS` file before opening it.
+notarized, so your system may show an unknown-developer warning. GitHub shows
+a copyable SHA-256 digest beside every download so you can verify it before
+opening it.
 
 ## Getting started
 

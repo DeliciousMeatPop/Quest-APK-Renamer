@@ -4,6 +4,11 @@ All notable changes to Quest APK Renamer are recorded here.
 
 ## Unreleased
 
+### Changed
+
+- Relied on GitHub's displayed release-asset SHA-256 digests instead of
+  publishing redundant platform checksum files.
+
 ### Fixed
 
 - Prevented legacy `v1.8` and `v1.9` tags from appearing as updates to the

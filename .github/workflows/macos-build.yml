@@ -137,20 +137,12 @@ jobs:
             echo "Apple notarization credentials are not configured; keeping the ad-hoc/Developer ID build."
           fi
 
-      - name: Create architecture checksum
-        shell: bash
-        run: |
-          cd dist
-          dmg="Quest-APK-Renamer-$APP_VERSION-macOS-${{ matrix.arch }}.dmg"
-          shasum -a 256 "$dmg" > "SHA256SUMS-macOS-${{ matrix.arch }}.txt"
-
       - name: Upload macOS release bundle
         uses: actions/upload-artifact@v4
         with:
           name: Quest-APK-Renamer-${{ env.APP_VERSION }}-macOS-${{ matrix.arch }}
           path: |
             dist/Quest-APK-Renamer-${{ env.APP_VERSION }}-macOS-${{ matrix.arch }}.dmg
-            dist/SHA256SUMS-macOS-${{ matrix.arch }}.txt
           if-no-files-found: error
 
       - name: Remove temporary signing keychain

@@ -113,8 +113,9 @@ The release workflows build:
 - `Quest-APK-Renamer-1.3.0-Setup.exe`;
 - `Quest-APK-Renamer-1.3.0-macOS-arm64.dmg`;
 - `Quest-APK-Renamer-1.3.0-macOS-x86_64.dmg`;
-- `Quest-APK-Renamer-1.3.0-Linux-x86_64.tar.gz`; and
-- platform-specific `SHA256SUMS-*.txt` files.
+- `Quest-APK-Renamer-1.3.0-Linux-x86_64.tar.gz`.
+
+GitHub displays a copyable SHA-256 digest beside every uploaded release asset.
 
 A `v*` tag creates a GitHub release automatically. A tag may match the app
 version exactly or add a prerelease suffix. For example, app version `1.3.0`

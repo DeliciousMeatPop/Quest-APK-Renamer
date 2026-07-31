@@ -16,7 +16,6 @@ chmod +x linux/build.sh linux/bootstrap-dependencies.sh
 Artifacts are written to `dist/`:
 
 - `Quest-APK-Renamer-1.3.0-Linux-x86_64.tar.gz`
-- `SHA256SUMS-Linux-x86_64.txt`
 
 The extracted bundle includes `install.sh` for a per-user installation under
 `~/.local/opt/quest-apk-renamer` and an app-launcher entry. No administrator

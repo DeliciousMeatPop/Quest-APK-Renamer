@@ -30,8 +30,7 @@ run:
 powershell -ExecutionPolicy Bypass -File .\windows\build.ps1 -BuildInstaller
 ```
 
-Tagged GitHub builds also create a portable ZIP and
-`SHA256SUMS-Windows.txt`. See
+Tagged GitHub builds also create a portable ZIP. See
 [`docs/RELEASING.md`](../docs/RELEASING.md) for the release checklist.
 
 Runtime downloads come from the Eclipse Adoptium API and Google's official

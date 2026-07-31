@@ -79,13 +79,6 @@ jobs:
             throw "The Windows installer was not created."
           }
 
-          $releaseFiles = @((Get-Item $portableZip), $installer)
-          $checksums = $releaseFiles | ForEach-Object {
-            $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
-            "$hash  $($_.Name)"
-          }
-          $checksums | Set-Content -Encoding ascii ".\dist\SHA256SUMS-Windows.txt"
-
       - name: Upload portable Windows app
         uses: actions/upload-artifact@v4
         with:
@@ -100,7 +93,6 @@ jobs:
           path: |
             dist/Quest-APK-Renamer-${{ env.APP_VERSION }}-Windows-portable.zip
             dist/installer/*.exe
-            dist/SHA256SUMS-Windows.txt
           if-no-files-found: error
 
       - name: Create or update tagged GitHub release
@@ -137,9 +129,7 @@ jobs:
           }
           $portableZip = Get-Item ".\dist\Quest-APK-Renamer-$env:APP_VERSION-Windows-portable.zip"
           $installer = Get-ChildItem ".\dist\installer\*.exe" | Select-Object -First 1
-          $checksums = Get-Item ".\dist\SHA256SUMS-Windows.txt"
           gh release upload $tag `
             $portableZip.FullName `
             $installer.FullName `
-            $checksums.FullName `
             --clobber

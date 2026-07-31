@@ -80,7 +80,6 @@ jobs:
           name: Quest-APK-Renamer-${{ env.APP_VERSION }}-Linux-x86_64
           path: |
             dist/Quest-APK-Renamer-${{ env.APP_VERSION }}-Linux-x86_64.tar.gz
-            dist/SHA256SUMS-Linux-x86_64.txt
           if-no-files-found: error
 
   release:
