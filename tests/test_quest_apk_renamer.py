@@ -1173,6 +1173,128 @@ Signer #1 certificate SHA-1 digest: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
             "f;./com.new.game/main.42.com.new.game.obb;3", content
         )
 
+    def test_build_lineage_dn_embeds_recognized_previous_signer(self):
+        dn = apk_analysis.build_lineage_dn(
+            signature_text="mr",
+            previous=("NothingIsFree", "NIF"),
+        )
+        self.assertIn("CN=Quest APK Renamer", dn)
+        self.assertIn("OU=mr", dn)
+        self.assertIn("O=QAR", dn)
+        self.assertIn("L=Previously signed by NothingIsFree (NIF)", dn)
+
+    def test_build_lineage_dn_falls_back_to_fresh_rename(self):
+        dn = apk_analysis.build_lineage_dn(signature_text="mr", previous=None)
+        self.assertIn("L=Fresh rename", dn)
+        self.assertNotIn("Previously signed by", dn)
+
+    def test_build_lineage_dn_sanitizes_values(self):
+        dn = apk_analysis.build_lineage_dn(
+            signature_text='ta"g;+',
+            previous=("Na\\me <Inc>", "lab=el"),
+        )
+        # Characters that would corrupt a -dname RDN never survive in a value.
+        for reserved in '"\\<>;+':
+            self.assertNotIn(reserved, dn)
+        # Only the four RDN assignments keep an '=' sign.
+        self.assertEqual(dn.count("="), 4)
+        # Value commas are stripped, leaving only the three RDN separators.
+        self.assertEqual(dn.count(","), 3)
+
+    def test_build_lineage_dn_length_cap(self):
+        long_name = "A" * 500
+        dn = apk_analysis.build_lineage_dn(previous=(long_name, "label"))
+        locality = dn.split("L=", 1)[1]
+        self.assertLessEqual(len(locality), apk_analysis.DN_VALUE_MAX_LENGTH)
+
+    def test_describe_previous_signer_ignores_unknown(self):
+        self.assertIsNone(apk_analysis.describe_previous_signer(None))
+        self.assertIsNone(
+            apk_analysis.describe_previous_signer({"id": "unknown", "label": "x"})
+        )
+        self.assertEqual(
+            apk_analysis.describe_previous_signer(
+                {"id": "nif", "label": "NIF", "full_name": "NothingIsFree"}
+            ),
+            ("NothingIsFree", "NIF"),
+        )
+
+    def test_signer_matching_excludes_ou_and_l_fields(self):
+        registry = apk_analysis.load_signer_registry(
+            Path(__file__).parents[1] / "resources" / "known-signers.json"
+        )
+        # A Quest APK Renamer output whose L= names another group must still
+        # match Quest APK Renamer, not the group named in the lineage line.
+        certificate = {
+            "subject": (
+                "CN=Quest APK Renamer, OU=NothingIsFree, O=QAR, "
+                "L=Previously signed by NothingIsFree (NIF)"
+            ),
+            "issuer": None,
+        }
+        self.assertEqual(
+            apk_analysis.identify_signer(certificate, registry)["id"],
+            "quest_apk_renamer",
+        )
+
+    def test_seed_registry_recognizes_scene_signers_by_dn_substring(self):
+        registry = apk_analysis.load_signer_registry(
+            Path(__file__).parents[1] / "resources" / "known-signers.json"
+        )
+        cases = {
+            "CN=Automagic Package Changer, O=APC": "automagic",
+            "CN=NotQuestUnderground, O=VRP": "vrp",
+            "CN=NothingIsFree, O=NIF": "nif",
+            "CN=JF, O=vrSrc": "vrsrc",
+        }
+        for subject, expected_id in cases.items():
+            with self.subTest(subject=subject):
+                identity = apk_analysis.identify_signer(
+                    {"subject": subject, "issuer": None}, registry
+                )
+                self.assertEqual(identity["id"], expected_id)
+
+    def test_rename_signature_text_describes_applied_tag(self):
+        self.assertEqual(
+            app.rename_signature_text("com.studio.game", "com.mr.studio.game"),
+            "mr",
+        )
+        self.assertEqual(
+            app.rename_signature_text("com.studio.game", "com.studio.gamea"),
+            "a",
+        )
+        self.assertEqual(
+            app.rename_signature_text("com.studio.game", "com.studio.game"),
+            "Renamed build",
+        )
+
+    def test_ensure_managed_key_caches_lineage_keystores_by_dname(self):
+        lineage_dir = self.tmp_path / "lineage-keys"
+        calls = []
+
+        def fake_run_command(command, log=None, secret_values=None):
+            # keytool writes the keystore file; emulate that side effect.
+            keystore_index = command.index("-keystore") + 1
+            Path(command[keystore_index]).write_bytes(b"keystore")
+            calls.append(command)
+
+        dname = apk_analysis.build_lineage_dn(previous=("NothingIsFree", "NIF"))
+        with (
+            mock.patch.object(app, "APP_DATA", self.tmp_path),
+            mock.patch.object(app, "LINEAGE_KEY_DIR", lineage_dir),
+            mock.patch.object(app, "find_keytool", return_value=Path("keytool")),
+            mock.patch.object(app.os, "chmod"),
+        ):
+            first = app.ensure_managed_key(fake_run_command, lambda *_: None, dname)
+            second = app.ensure_managed_key(fake_run_command, lambda *_: None, dname)
+
+        self.assertEqual(first, second)
+        self.assertEqual(Path(first[0]).parent, lineage_dir)
+        # The DN is passed verbatim to keytool.
+        self.assertIn(dname, calls[0])
+        # The keystore is generated once and reused on the second call.
+        self.assertEqual(len(calls), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

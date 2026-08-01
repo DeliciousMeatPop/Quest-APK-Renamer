@@ -4,8 +4,27 @@ All notable changes to Quest APK Renamer are recorded here.
 
 ## Unreleased
 
+### Added
+
+- Cert-embedded signing lineage: when a renamed APK is re-signed and its source
+  was signed by a recognized signer, the previous signer's identity is baked into
+  the new certificate's Distinguished Name (`L=Previously signed by …`), so
+  provenance travels inside the file itself and survives re-inspection by any
+  tool. Lineage keystores are cached by a hash of their full DN and included in
+  signing-key backups.
+- A pre-seeded known-signer registry with additional scene entries (Automagic
+  Package Changer, NotQuestUnderground/VRP, NothingIsFree/NIF, vrSrc/JF) so
+  recognition works on first launch with an empty user config.
+- A semantic `.mr` ("mixed-reality fix") quick ID preset alongside the existing
+  suffix and tag presets.
+
 ### Changed
 
+- Documented that known-signer recognition matches only the certificate `CN` and
+  `O` fields, deliberately excluding `OU` (user signature text) and `L` (the new
+  lineage breadcrumb) to avoid false positives.
+- Broadened the single-file drag-and-drop on-ramp copy so dropping one `.apk`
+  loads it straight into the rename pipeline.
 - Relied on GitHub's displayed release-asset SHA-256 digests instead of
   publishing redundant platform checksum files.
 

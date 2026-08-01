@@ -51,7 +51,9 @@ from tkinter import (
 )
 
 from apk_analysis import (
+    build_lineage_dn,
     compute_hashes,
+    describe_previous_signer,
     detect_existing_tag,
     identify_signer,
     inspect_apk as analyze_apk_file,
@@ -145,6 +147,10 @@ def platform_app_data() -> Path:
 APP_DATA = platform_app_data()
 MANAGED_KEYSTORE = APP_DATA / "quest-renamer-signing-key.jks"
 MANAGED_KEY_INFO = APP_DATA / "signing-key.json"
+# Lineage keystores embed the previous signer's identity in their certificate
+# DN, so each unique DN needs its own persistent key. They are cached here by a
+# hash of the full DN to avoid regenerating a key on every run.
+LINEAGE_KEY_DIR = APP_DATA / "lineage-keys"
 KEY_BACKUP_MARKER = APP_DATA / "signing-key-backup.json"
 SETTINGS_FILE = APP_DATA / "settings.json"
 SESSION_LOG_FILE = APP_DATA / "Quest-APK-Renamer.log"
@@ -566,6 +572,28 @@ def package_with_suffix(package_name: str, suffix: str) -> str:
     if not is_valid_package(result):
         raise UserError(f"Adding “{suffix}” would create an invalid package ID.")
     return result
+
+
+def rename_signature_text(old_package: str, new_package: str) -> str:
+    """Describe the rename tag applied, for the signing certificate's OU field."""
+    old_package = (old_package or "").strip()
+    new_package = (new_package or "").strip()
+    if not new_package or new_package == old_package:
+        return "Renamed build"
+    if old_package and new_package.startswith(old_package):
+        added = new_package[len(old_package):].lstrip(".")
+        if added:
+            return added
+    old_parts = old_package.split(".") if old_package else []
+    new_parts = new_package.split(".")
+    if (
+        len(new_parts) == len(old_parts) + 1
+        and old_parts
+        and new_parts[0] == old_parts[0]
+        and new_parts[2:] == old_parts[1:]
+    ):
+        return new_parts[1]
+    return "Renamed build"
 
 
 def discover_bundle_folders(parent: Path) -> tuple[list[Path], list[str]]:
@@ -1002,11 +1030,16 @@ def load_managed_key() -> tuple[Path, str, str]:
         raise UserError(f"Could not read the managed signing key: {exc}") from exc
 
 
-def ensure_managed_key(run_command, log) -> tuple[Path, str, str]:
-    APP_DATA.mkdir(parents=True, exist_ok=True)
-    if MANAGED_KEYSTORE.is_file() and MANAGED_KEY_INFO.is_file():
-        return load_managed_key()
+DEFAULT_KEY_DNAME = "CN=Quest APK Renamer, OU=Local Build, O=Local, L=Local, ST=Local, C=US"
 
+
+def _generate_keystore(
+    keystore: Path,
+    info_path: Path,
+    dname: str,
+    run_command,
+    log,
+) -> tuple[Path, str, str]:
     alias = "quest-renamer"
     password = secrets.token_urlsafe(24)
     log("Creating a persistent local signing identity…")
@@ -1016,7 +1049,7 @@ def ensure_managed_key(run_command, log) -> tuple[Path, str, str]:
             "-genkeypair",
             "-noprompt",
             "-keystore",
-            str(MANAGED_KEYSTORE),
+            str(keystore),
             "-storepass",
             password,
             "-keypass",
@@ -1030,18 +1063,45 @@ def ensure_managed_key(run_command, log) -> tuple[Path, str, str]:
             "-validity",
             "10000",
             "-dname",
-            "CN=Quest APK Renamer, OU=Local Build, O=Local, L=Local, ST=Local, C=US",
+            dname,
         ],
         log=log,
         secret_values={password},
     )
-    MANAGED_KEY_INFO.write_text(
+    info_path.write_text(
         json.dumps({"alias": alias, "password": password}, indent=2) + "\n",
         encoding="utf-8",
     )
-    os.chmod(MANAGED_KEY_INFO, stat.S_IRUSR | stat.S_IWUSR)
-    os.chmod(MANAGED_KEYSTORE, stat.S_IRUSR | stat.S_IWUSR)
-    return MANAGED_KEYSTORE, alias, password
+    os.chmod(info_path, stat.S_IRUSR | stat.S_IWUSR)
+    os.chmod(keystore, stat.S_IRUSR | stat.S_IWUSR)
+    return keystore, alias, password
+
+
+def ensure_managed_key(run_command, log, dname: str | None = None) -> tuple[Path, str, str]:
+    APP_DATA.mkdir(parents=True, exist_ok=True)
+
+    # The default signing identity keeps its canonical file names so existing
+    # installs, backups, and preflight checks continue to work unchanged.
+    if dname is None or dname == DEFAULT_KEY_DNAME:
+        if MANAGED_KEYSTORE.is_file() and MANAGED_KEY_INFO.is_file():
+            return load_managed_key()
+        return _generate_keystore(
+            MANAGED_KEYSTORE, MANAGED_KEY_INFO, DEFAULT_KEY_DNAME, run_command, log
+        )
+
+    # Lineage identities are cached by a hash of the full DN so each unique
+    # provenance chain reuses one persistent key across runs.
+    LINEAGE_KEY_DIR.mkdir(parents=True, exist_ok=True)
+    digest = hashlib.sha256(dname.encode("utf-8")).hexdigest()[:16]
+    keystore = LINEAGE_KEY_DIR / f"signing-{digest}.jks"
+    info_path = LINEAGE_KEY_DIR / f"signing-{digest}.json"
+    if keystore.is_file() and info_path.is_file():
+        try:
+            info = json.loads(info_path.read_text(encoding="utf-8"))
+            return keystore, info["alias"], info["password"]
+        except (OSError, KeyError, json.JSONDecodeError):
+            pass
+    return _generate_keystore(keystore, info_path, dname, run_command, log)
 
 
 def replace_package_references_with_report(
@@ -1967,7 +2027,7 @@ class RenamerApp:
         self.choose_folder_button.pack(fill=X)
         self.drop_hint_var = StringVar(
             value=(
-                "or drop a folder here  •  several folders open Bulk"
+                "or drop one .apk or a game folder here  •  several folders open Bulk"
                 if DND_AVAILABLE
                 else "Use the button above to choose a folder."
             )
@@ -2042,17 +2102,17 @@ class RenamerApp:
         ).pack(anchor="w", pady=(0, 3))
         preset_buttons = ttk.Frame(preset_row, style="CardBody.TFrame")
         preset_buttons.pack(fill=X)
-        for column in range(5):
+        preset_modes = (
+            ("+a", "suffix:a"),
+            (".mr", "tag:mr"),
+            (".dev", "tag:dev"),
+            (".test", "tag:test"),
+            (".qa", "tag:qa"),
+        )
+        for column in range(len(preset_modes) + 1):
             preset_buttons.columnconfigure(column, weight=1)
         self.package_preset_buttons = []
-        for column, (label, mode) in enumerate(
-            (
-                ("+a", "suffix:a"),
-                (".dev", "tag:dev"),
-                (".test", "tag:test"),
-                (".qa", "tag:qa"),
-            )
-        ):
+        for column, (label, mode) in enumerate(preset_modes):
             button = ttk.Button(
                 preset_buttons,
                 text=label,
@@ -2069,7 +2129,7 @@ class RenamerApp:
             command=self.apply_custom_package_tag,
             state="disabled",
         )
-        custom_preset.grid(row=0, column=4, sticky="ew")
+        custom_preset.grid(row=0, column=len(preset_modes), sticky="ew")
         self.package_preset_buttons.append(custom_preset)
         self.current_info_label = ttk.Label(
             settings,
@@ -2605,13 +2665,13 @@ class RenamerApp:
 
     def _on_drop_enter(self, _event):
         if not self.busy:
-            self.drop_hint_var.set("Release to load this game folder")
+            self.drop_hint_var.set("Release to load this game")
             self.drop_hint_label.configure(style="InlineSuccess.TLabel")
         return "copy"
 
     def _on_drop_leave(self, _event):
         self.drop_hint_var.set(
-            "or drop a folder here  •  several folders open Bulk"
+            "or drop one .apk or a game folder here  •  several folders open Bulk"
         )
         self.drop_hint_label.configure(style="Hint.TLabel")
         return "copy"
@@ -2645,13 +2705,14 @@ class RenamerApp:
                 bundle = detect_bundle(path)
             else:
                 raise UserError(
-                    "Drop the game folder containing the APK and OBB files."
+                    "Drop a single .apk file or the game folder containing the "
+                    "APK and OBB files."
                 )
         except UserError as exc:
             messagebox.showerror("Cannot load dropped item", str(exc))
             return "copy"
         self._load_bundle(bundle)
-        self.drop_hint_var.set("✓ Folder loaded — drop another folder to replace it")
+        self.drop_hint_var.set("✓ Game loaded — drop another .apk or folder to replace it")
         self.drop_hint_label.configure(style="InlineSuccess.TLabel")
         return "copy"
 
@@ -5264,8 +5325,25 @@ class RenamerApp:
 
                 output.mkdir(parents=True, exist_ok=True)
                 if should_sign:
+                    source_identity = (
+                        (source_analysis or {}).get("signature", {}).get("identity")
+                    )
+                    previous_signer = describe_previous_signer(source_identity)
+                    signing_dname = None
+                    if previous_signer:
+                        signing_dname = build_lineage_dn(
+                            signature_text=rename_signature_text(
+                                old_package, new_package
+                            ),
+                            previous=previous_signer,
+                        )
+                        log(
+                            "Embedding signing lineage in the new certificate: "
+                            f"previously signed by {previous_signer[0]} "
+                            f"({previous_signer[1]})."
+                        )
                     keystore, alias, password = ensure_managed_key(
-                        self._run_command, log
+                        self._run_command, log, signing_dname
                     )
                     signed_dir.mkdir(parents=True, exist_ok=True)
                     log("Zip-aligning, signing, and verifying APK…")
@@ -6212,10 +6290,22 @@ class RenamerApp:
             destination.mkdir(parents=False)
             shutil.copy2(MANAGED_KEYSTORE, destination / MANAGED_KEYSTORE.name)
             shutil.copy2(MANAGED_KEY_INFO, destination / MANAGED_KEY_INFO.name)
+            lineage_backed_up = 0
+            if LINEAGE_KEY_DIR.is_dir():
+                lineage_destination = destination / LINEAGE_KEY_DIR.name
+                lineage_destination.mkdir(parents=False)
+                for lineage_file in sorted(LINEAGE_KEY_DIR.iterdir()):
+                    if lineage_file.is_file():
+                        shutil.copy2(
+                            lineage_file, lineage_destination / lineage_file.name
+                        )
+                        lineage_backed_up += 1
             (destination / "KEEP-PRIVATE.txt").write_text(
                 "Quest APK Renamer signing-key backup\n\n"
                 "Keep both the .jks and signing-key.json files private and together.\n"
-                "They are required to update apps signed with this identity.\n",
+                "They are required to update apps signed with this identity.\n"
+                "The lineage-keys folder holds provenance-embedded signing keys "
+                "used for renamed apps whose source signer was recognized.\n",
                 encoding="utf-8",
             )
             APP_DATA.mkdir(parents=True, exist_ok=True)
@@ -6237,7 +6327,12 @@ class RenamerApp:
             )
             return
         self.preflight_var.set("Signing key backed up successfully.")
-        self._append_log(f"Signing key backed up to: {destination}")
+        lineage_note = (
+            f" (plus {lineage_backed_up} lineage key file(s))"
+            if lineage_backed_up
+            else ""
+        )
+        self._append_log(f"Signing key backed up to: {destination}{lineage_note}")
         messagebox.showinfo(
             "Signing key backed up",
             f"Backup created at:\n\n{destination}\n\n"

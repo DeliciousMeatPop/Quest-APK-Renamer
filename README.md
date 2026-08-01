@@ -50,6 +50,14 @@ release packages already include the Android tools and Java runtime they need.
 The app also includes an APK inspector, bulk processing, safe cancellation,
 failed-OBB retry, signing-key backups, and a persistent activity log.
 
+When it re-signs a renamed APK whose source was signed by a recognized signer,
+the previous signer's identity is embedded in the new certificate's Distinguished
+Name (`L=Previously signed by …`). Provenance therefore travels inside the file
+itself and stays visible when the APK is re-inspected later, even by a different
+tool. Signer recognition matches only the certificate `CN` and `O` fields against
+a pre-seeded registry (`resources/known-signers.json`), so it keeps working
+across key rotations and on first launch with no user configuration.
+
 ## Download
 
 Open the [1.3.0 beta 1 release](../../releases/tag/v1.3.0-beta.1) and download the
@@ -73,8 +81,10 @@ opening it.
 
 1. Connect your Quest with a data-capable USB cable.
 2. Approve the USB debugging prompt inside the headset and keep it awake.
-3. Choose or drop the game's main folder into Quest APK Renamer.
-4. Accept the suggested app ID or enter your own.
+3. Choose or drop the game's main folder — or a single `.apk` file — into
+   Quest APK Renamer.
+4. Accept the suggested app ID, pick a quick preset (including `.mr` for a
+   mixed-reality fix), or enter your own.
 5. Wait for **Ready to build**, then select **Create renamed game**.
 6. Select **Install finished game** when the build completes.
 
@@ -154,6 +164,11 @@ They are stored in:
 Android requires the same key to update an installed renamed app. If the key is
 lost, you will need to uninstall that app before installing a build signed with
 a different one.
+
+Renames whose source was signed by a recognized signer use provenance-embedded
+lineage keys stored alongside the default identity in a `lineage-keys` folder.
+The built-in signing-key backup copies these too, so keep the whole backup
+folder together.
 
 ## Troubleshooting
 
