@@ -22,12 +22,15 @@ Domain models          Infrastructure adapters
 - The dashboard and bulk queue use separate presentation controllers and share the same typed
   engine adapters. Their busy-state providers prevent both workspaces from starting expensive
   operations at the same time.
-- The Library controller presents the local signing-key vault separately from a generation-guarded
-  live headset inventory. The JSON store owns recoverable atomic serialization; the main workflow
-  only asks it to match, record, or retrieve profiles.
-- Library import/export runs off the UI thread. Portable archives are size-bounded, reject unsafe
-  paths, verify artifact hashes before activation, and copy imported private files into unique
-  local identity folders rather than trusting paths from another computer.
+- The Library controller presents a generation-guarded live headset inventory. Managed renamed
+  apps own a package-specific identity under `/sdcard/QAPKR`; older desktop JSON profiles are
+  migration inputs rather than a second user-facing vault.
+- Identity reads and writes run off the UI thread. Quest writes stage every artifact, verify its
+  SHA-256 digest, keep immutable versioned artifacts, and publish the profile manifest last.
+  Identity operations are serialized so overlapping refresh, save, and delete jobs cannot clean
+  one another's files. Portable recovery archives are
+  size-bounded, reject unsafe paths and IDs, verify hashes, and can be restored only to the
+  matching selected package.
 - The detailed Inspector has its own controller and full-decode adapter. Normal Dashboard analysis
   remains manifest-only; deeper signature, resource, hash, and reference scans run only when the
   user opens the Inspector.
@@ -40,6 +43,8 @@ Domain models          Infrastructure adapters
 - Worker results return as typed snapshots or results through queued Qt signals.
 - Bulk jobs execute sequentially in one worker and publish per-item snapshots through a
   `QAbstractListModel`; a failed item is recorded before the next item starts.
+- Bulk and Dashboard jobs resolve the same package-specific signing identity. Their verified
+  build/install results return to the Library on the Qt thread for headset identity persistence.
 - Cancellation is cooperative and occurs at documented safe boundaries. Bundle installs finish
   the active APK or OBB command, then stop before the next file.
 
@@ -55,10 +60,9 @@ Domain models          Infrastructure adapters
   unrelated original. It runs only after APK and OBB verification and requires the app's build
   report, a direct-child APK, and a non-home/non-root path. Source replacement and post-install
   cleanup remain independent settings.
-- Signing-key backups contain the canonical identity, every cert-lineage identity, and recorded
-  hashes. A new lineage key makes the prior backup marker stale. Restores validate the complete
-  backup before asking for replacement confirmation, activate through a sibling staging folder,
-  and preserve the previous identity in a recovery folder.
+- New build identities are package-specific and stay in recoverable cache until a verified install
+  stores them on the target headset. The legacy desktop signing store remains readable for
+  migration, while per-app `.qarlib` recovery archives provide explicit portability.
 - Quest updates stage changed OBBs under transaction names, reuse identical remote data, and keep
   replacement backups until APK and OBB verification succeeds. Cleanup targets only versioned
   expansion files or names previously recorded as app-managed; unknown files remain untouched.

@@ -10,7 +10,11 @@ permissions:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -19,6 +23,7 @@ jobs:
           python-version: "3.13"
           cache: pip
       - name: Install Qt runtime libraries
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install --yes libegl1
@@ -33,4 +38,5 @@ jobs:
           ruff check src tests scripts
           mypy src
           pytest -q
+          pyside6-qmllint --missing-property error --unqualified disable src/quest_renamer/qml/*.qml
           quest-renamer --smoke-test

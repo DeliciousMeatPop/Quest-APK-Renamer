@@ -310,7 +310,7 @@ class BuildEngineTests(unittest.TestCase):
             engine.build(request)
 
             key_commands = [command for command in runner.commands if "-genkeypair" in command]
-            self.assertEqual(len(key_commands), 2)
+            self.assertEqual(len(key_commands), 1)
             lineage_command = key_commands[-1]
             dname = lineage_command[lineage_command.index("-dname") + 1]
             self.assertIn("OU=mr", dname)

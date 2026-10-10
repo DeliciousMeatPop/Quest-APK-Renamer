@@ -4,6 +4,41 @@ All notable changes to Quest APK Renamer are recorded here.
 
 ## Unreleased
 
+## [1.5.0] - 2026-10-10
+
+### Added
+
+- The Library now stores a separate verified update identity for each managed app on the Quest
+  under `/sdcard/QAPKR/identities/<package>`. Transfers are staged, SHA-256 checked, and committed
+  atomically; corrupt or mismatched identities are shown as errors and never reused silently.
+- Managed apps can export, restore, replace, or remove their own private `.qarlib` recovery
+  identity directly from the connected-headset Library.
+
+### Changed
+
+- A new application icon now identifies the package-editing workflow with an Android document,
+  signature stroke, and editing pencil across Linux, Windows, and macOS packages.
+- The Library is now only a live view of apps on the connected headset. The desktop key vault and
+  mode switch are gone; older local records are used only to migrate an installed app on its next
+  verified update.
+- New signing keys are package-specific and remain in recoverable cache until installation stores
+  them on the target headset. Installing the same build on several headsets in one session stores
+  the identity on each headset.
+
+### Fixed
+
+- Interrupted identity replacement can no longer invalidate the previous Quest key: immutable,
+  versioned artifacts are published behind a manifest commit and concurrent identity operations
+  are serialized.
+- Installing a finished build after restarting QAPKR now reconnects it to its pending signing
+  identity. Bulk builds and installs use the same per-app key selection and verified headset
+  storage path as the Dashboard.
+- Managed Library updates refuse a different source game and block identities that fail integrity
+  checks instead of falling through to a normal renamed build.
+- Package rewrites fail closed when decoded references cannot be scanned, verified OBB transfers
+  are checked by SHA-256, and a queued device refresh no longer discards the useful poll result.
+- CI now audits runtime dependencies and validates its pinned action/tooling configuration.
+
 ## [1.4.7] - 2026-08-29
 
 ### Fixed

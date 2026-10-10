@@ -89,10 +89,15 @@ class SigningIdentityStore:
         token: CancellationToken,
         log: Callable[[str], None] | None = None,
         dname: str | None = None,
+        ensure_canonical: bool = True,
     ) -> SigningIdentity:
         # Keep the canonical identity available for ordinary builds and backups
         # even when the first APK happens to use a lineage-specific certificate.
-        if dname and not (self.keystore.is_file() and self.metadata.is_file()):
+        if (
+            dname
+            and ensure_canonical
+            and not (self.keystore.is_file() and self.metadata.is_file())
+        ):
             self.load_or_create(token=token, log=log)
         keystore, metadata = self._paths_for_dname(dname)
         if keystore.is_file() and metadata.is_file():

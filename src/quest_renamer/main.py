@@ -33,6 +33,7 @@ from quest_renamer.infrastructure.legacy_identity import (
 from quest_renamer.infrastructure.library_store import GameLibraryStore
 from quest_renamer.infrastructure.local_bundles import LocalBundleInspector
 from quest_renamer.infrastructure.older_firmware_patch import verified_older_firmware_asset
+from quest_renamer.infrastructure.quest_identity_store import QuestIdentityStore
 from quest_renamer.infrastructure.settings_store import JsonSettingsStore
 from quest_renamer.infrastructure.signing_backup import SigningIdentityManager
 from quest_renamer.infrastructure.tool_manager import PinnedToolManager
@@ -244,6 +245,11 @@ def main() -> int:
         library_store,
         signing_root=signing_root,
         installed_apps=device_service.installed_apps,
+        device_identities=QuestIdentityStore(
+            paths.cache / "device-identities",
+            resource_root=package_root,
+            executable=Path(sys.executable),
+        ),
         parent=engine,
     )
     installer = AdbApkInstaller(
@@ -252,7 +258,9 @@ def main() -> int:
     )
     build_engine = StagedApkBuildEngine(
         toolchain,
-        signing_root=signing_root,
+        # New identities live in recoverable cache only until a verified install
+        # copies them to that headset's /sdcard/QAPKR folder.
+        signing_root=paths.cache / "pending-signing",
         cache_root=paths.cache / "build",
         older_firmware_asset=older_firmware_asset,
         move_to_trash=move_to_trash,
@@ -341,6 +349,13 @@ def main() -> int:
         save_dismissal=controller.dismiss_update_version,
         parent=engine,
     )
+
+    def bulk_signing_identity(package_name: str) -> tuple[Path | None, Path | None]:
+        profile = library_controller.profile_for_target(package_name)
+        if profile is None or not profile.key_available:
+            return None, None
+        return Path(profile.signing_keystore), Path(profile.signing_metadata)
+
     bulk_controller = BulkController(
         inspector=inspector,
         analyzer=analyzer,
@@ -355,6 +370,9 @@ def main() -> int:
             or tool_controller.has_active_work()
         ),
         move_to_trash=move_to_trash,
+        signing_identity=bulk_signing_identity,
+        record_build=library_controller.record_build,
+        record_install=library_controller.record_install,
         parent=engine,
     )
     controller.set_external_busy_provider(

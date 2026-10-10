@@ -17,9 +17,11 @@ from quest_renamer.services.preflight import AutomaticPreflight
 class SelectiveBuilder:
     def __init__(self) -> None:
         self.packages: list[str] = []
+        self.requests: list[BuildRequest] = []
 
     def build(self, request: BuildRequest, **_kwargs: object) -> BuildResult:
         self.packages.append(request.package_name)
+        self.requests.append(request)
         if "broken" in request.package_name:
             raise BuildError("simulated build failure")
         output = request.output_root
@@ -115,6 +117,53 @@ class BulkControllerTests(unittest.TestCase):
                 ["com.example.broken", "com.example.first"],
             )
             self.assertIn("1 succeeded • 1 failed", controller.overviewText)
+
+    def test_bulk_uses_and_records_per_app_signing_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            game = root / "Game"
+            self._game(game, "com.example.game")
+            key = root / "key.p12"
+            metadata = root / "identity.json"
+            key.touch()
+            metadata.touch()
+            builder = SelectiveBuilder()
+            installer = SelectiveInstaller()
+            builds: list[tuple[str, str]] = []
+            installs: list[tuple[str, str]] = []
+            controller = BulkController(
+                inspector=LocalBundleInspector(),
+                analyzer=None,
+                preflight_service=AutomaticPreflight(tools_ready=True),
+                build_engine=builder,
+                bundle_installer=installer,
+                settings_store=JsonSettingsStore(root / "settings.json"),
+                device_snapshot=lambda: DeviceSnapshot(
+                    True, "connected", "QUEST123", "Quest 3", 10_000_000_000
+                ),
+                signing_identity=lambda _package: (key, metadata),
+                record_build=lambda source, target, _result, _patches: builds.append(
+                    (source.package_name, target)
+                ),
+                record_install=lambda bundle, _result, serial: installs.append(
+                    (bundle.package_name, serial)
+                ),
+            )
+
+            controller.addFolder(QUrl.fromLocalFile(str(game)))
+            self._wait_until(lambda: controller.count == 1)
+            controller.requestBuild()
+            controller.confirmOperation()
+            self._wait_until(lambda: controller.hasOverview)
+
+            self.assertEqual(builder.requests[0].signing_keystore, key)
+            self.assertEqual(builder.requests[0].signing_metadata, metadata)
+            self.assertEqual(builds, [("com.example.game", "com.example.gamea")])
+
+            controller.requestInstall()
+            controller.confirmOperation()
+            self._wait_until(lambda: controller.overviewTitle == "Bulk install complete")
+            self.assertEqual(installs, [("com.example.gamea", "QUEST123")])
 
     def _controller(
         self,

@@ -410,6 +410,7 @@ class AdbApkInstaller:
         used_remote: set[str] = set()
         prepared: list[_PreparedObb] = []
         total = len(bundle.obbs)
+        bundle_names = {item.name for item in bundle.obbs}
         for index, obb in enumerate(bundle.obbs, start=1):
             token.raise_if_cancelled()
             remote_path = f"{remote_root}/{obb.name}"
@@ -435,7 +436,6 @@ class AdbApkInstaller:
                     continue
 
             reusable: _RemoteObb | None = None
-            bundle_names = {item.name for item in bundle.obbs}
             for candidate in remote.values():
                 if (
                     candidate.name in used_remote
@@ -511,6 +511,28 @@ class AdbApkInstaller:
                     f"Quest reported the wrong size for {obb.name}.",
                     failed_obbs=remaining,
                 )
+            progress(
+                base_progress + span * 0.98,
+                f"Verifying uploaded OBB {index} of {total} • {obb.name}",
+            )
+            if not local_hash:
+                local_hash = self._local_sha256(obb, token)
+            remote_hash = self._remote_sha256(target, staged, token, log)
+            if not remote_hash:
+                self._remove_remote(target, staged, log)
+                remaining = tuple(bundle.obbs[index - 1 :])
+                raise BundleInstallError(
+                    f"The Quest could not verify the SHA-256 checksum for {obb.name}.",
+                    failed_obbs=remaining,
+                )
+            if remote_hash != local_hash:
+                self._remove_remote(target, staged, log)
+                remaining = tuple(bundle.obbs[index - 1 :])
+                raise BundleInstallError(
+                    f"The uploaded OBB did not match the source file: {obb.name}.",
+                    failed_obbs=remaining,
+                )
+            log(f"Verified uploaded OBB with SHA-256: {obb.name}")
             prepared.append(
                 _PreparedObb(
                     obb,

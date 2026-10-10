@@ -5,8 +5,9 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
-from PySide6.QtCore import QCoreApplication, QUrl
+from PySide6.QtCore import QCoreApplication, QTimer, QUrl
 from test_bulk_controller import SelectiveBuilder
 from test_controller import ImmediateAnalyzer, ImmediateBundleInstaller
 
@@ -168,6 +169,35 @@ class ControllerGuardTests(unittest.TestCase):
 
             self.assertEqual(controller.notice, "Renamed copy built, signed, and verified.")
             self.assertEqual(controller.noticeTone, "success")
+
+    def test_slow_device_poll_applies_its_result_before_queued_refresh(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            controller = AppController(paths=AppPaths(data=root / "data", cache=root / "cache"))
+            controller._device_check_running = True
+            controller._device_refresh_pending = True
+            queued: list[object] = []
+
+            with patch.object(
+                QTimer,
+                "singleShot",
+                side_effect=lambda _delay, call: queued.append(call),
+            ):
+                controller._apply_device_snapshot(
+                    DeviceSnapshot(
+                        True,
+                        "connected",
+                        "QUEST123",
+                        "Quest 3",
+                        5_000_000_000,
+                    )
+                )
+
+            self.assertEqual(controller.currentSerial, "QUEST123")
+            self.assertEqual(controller.deviceTone, "success")
+            self.assertFalse(controller._device_check_running)
+            self.assertFalse(controller._device_refresh_pending)
+            self.assertEqual(len(queued), 1)
 
     def test_push_stage_failure_retries_with_a_full_install(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -406,7 +436,7 @@ class LibrarySignalTests(unittest.TestCase):
 
             self.assertEqual(len(rows_signals), rows_before)
             library.setShowInstalled(False)
-            self.assertEqual(len(rows_signals), rows_before + 1)
+            self.assertEqual(len(rows_signals), rows_before)
 
 
 if __name__ == "__main__":

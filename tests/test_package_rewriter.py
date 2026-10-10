@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from quest_renamer.domain.operations import CancellationToken
 from quest_renamer.infrastructure.package_rewriter import replace_package_references
@@ -281,6 +282,40 @@ class PackageRewriterTests(unittest.TestCase):
                 find_jni_libraries(decoded, "com.example.game", CancellationToken()),
                 ("lib/arm64-v8a/libglue.so",),
             )
+
+    def test_oversized_technical_file_fails_instead_of_being_silently_skipped(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            decoded = Path(temporary)
+            manifest = decoded / "AndroidManifest.xml"
+            manifest.write_text('package="com.example.game"', encoding="utf-8")
+
+            with (
+                patch("quest_renamer.infrastructure.package_rewriter.MAX_SCAN_SIZE", 8),
+                self.assertRaisesRegex(ValueError, "too large to rewrite safely"),
+            ):
+                replace_package_references(
+                    decoded,
+                    "com.example.game",
+                    "com.dev.example.game",
+                    token=CancellationToken(),
+                )
+
+    def test_unreadable_technical_file_fails_instead_of_being_silently_skipped(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            decoded = Path(temporary)
+            manifest = decoded / "AndroidManifest.xml"
+            manifest.write_text('package="com.example.game"', encoding="utf-8")
+
+            with (
+                patch.object(Path, "read_bytes", side_effect=PermissionError("denied")),
+                self.assertRaisesRegex(ValueError, "could not be read: AndroidManifest.xml"),
+            ):
+                replace_package_references(
+                    decoded,
+                    "com.example.game",
+                    "com.dev.example.game",
+                    token=CancellationToken(),
+                )
 
 
 if __name__ == "__main__":

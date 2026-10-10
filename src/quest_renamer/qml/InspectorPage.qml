@@ -94,7 +94,7 @@ Item {
 
         Rectangle {
             Layout.fillWidth: true
-            Layout.preferredHeight: 92
+            Layout.fillHeight: true
             radius: 3
             color: inspectorDrop.containsDrag ? "#202025" : root.panel
             border.width: 1
@@ -110,96 +110,6 @@ Item {
                         inspectorController.inspectApk(drop.urls[0])
                 }
             }
-
-            ColumnLayout {
-                anchors.fill: parent
-                anchors.margins: 14
-                spacing: 4
-                RowLayout {
-                    Layout.fillWidth: true
-                    Text {
-                        Layout.maximumWidth: root.width * 0.45
-                        text: inspectorController.title
-                        color: inspectorController.apkPath ? root.textPrimary : "#777777"
-                        font.pixelSize: 14
-                        font.weight: Font.DemiBold
-                        elide: Text.ElideMiddle
-                    }
-                    Text {
-                        Layout.fillWidth: true
-                        text: inspectorController.packageName
-                        color: "#8b8b8b"
-                        font.pixelSize: 11
-                        elide: Text.ElideMiddle
-                    }
-                    BusyIndicator {
-                        visible: inspectorController.isBusy
-                        running: visible
-                        Layout.preferredWidth: 20
-                        Layout.preferredHeight: 20
-                        Accessible.name: "APK inspection in progress"
-                    }
-                    Rectangle {
-                        visible: inspectorController.hasAnalysis
-                        implicitWidth: signerText.implicitWidth + 18
-                        implicitHeight: 25
-                        radius: 12
-                        color: inspectorController.signerTone === "success" ? "#263c32"
-                             : inspectorController.signerTone === "warning" ? "#3a3418"
-                             : "#2b2b31"
-                        Text {
-                            id: signerText
-                            anchors.centerIn: parent
-                            text: inspectorController.signerLabel
-                            color: inspectorController.signerTone === "success" ? "#a8d3b9"
-                                 : inspectorController.signerTone === "warning" ? "#e8c45c"
-                                 : "#b5b5b5"
-                            font.pixelSize: 10
-                            font.weight: Font.Medium
-                        }
-                    }
-                }
-                Text {
-                    Layout.fillWidth: true
-                    text: inspectorController.hasAnalysis
-                          ? inspectorController.summary
-                          : (inspectorController.apkPath || "Drop one APK here to inspect it.")
-                    color: "#858585"
-                    font.pixelSize: 10
-                    elide: Text.ElideMiddle
-                }
-                Text {
-                    Layout.fillWidth: true
-                    text: inspectorController.status
-                          + (inspectorController.isBusy
-                             ? "  " + Math.round(inspectorController.progress * 100) + "%"
-                             : "")
-                    color: inspectorController.tone === "success" ? "#70b18f"
-                         : inspectorController.tone === "warning" ? "#e3b74a"
-                         : inspectorController.tone === "error" ? "#e5706a"
-                         : "#888888"
-                    font.pixelSize: 10
-                    elide: Text.ElideRight
-                }
-            }
-
-            ThinProgress {
-                visible: inspectorController.isBusy
-                anchors.left: parent.left
-                anchors.right: parent.right
-                anchors.bottom: parent.bottom
-                value: inspectorController.progress
-                fillColor: root.accent
-            }
-        }
-
-        Rectangle {
-            Layout.fillWidth: true
-            Layout.fillHeight: true
-            radius: 3
-            color: root.panel
-            border.width: 1
-            border.color: root.line
 
             ColumnLayout {
                 anchors.fill: parent
@@ -267,16 +177,26 @@ Item {
                         }
                         Text {
                             width: parent.width
-                            text: inspectorController.isBusy
-                                  ? "The APK is being decoded in a temporary workspace. The source file stays untouched."
-                                  : "Choose one APK, use the Dashboard selection, or drop a file above."
-                            color: root.textSecondary
+                            text: inspectorController.status
+                                  + (inspectorController.isBusy
+                                     ? "  " + Math.round(inspectorController.progress * 100) + "%"
+                                     : "")
+                            color: inspectorController.tone === "warning" ? "#e3b74a"
+                                 : inspectorController.tone === "error" ? "#e5706a"
+                                 : root.textSecondary
                             font.pixelSize: 12
                             wrapMode: Text.WordWrap
                             horizontalAlignment: Text.AlignHCenter
                             lineHeight: 1.25
                         }
                     }
+                }
+
+                ThinProgress {
+                    visible: inspectorController.isBusy
+                    Layout.fillWidth: true
+                    value: inspectorController.progress
+                    fillColor: root.accent
                 }
 
                 StackLayout {

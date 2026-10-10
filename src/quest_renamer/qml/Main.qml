@@ -187,7 +187,7 @@ ApplicationWindow {
 
     DecisionDialog {
         id: libraryImportDialog
-        heading: "Import saved identities?"
+        heading: "Restore this app's update key?"
         bodyText: ""
         primaryText: "Import"
         secondaryText: "Cancel"
@@ -198,9 +198,9 @@ ApplicationWindow {
 
     DecisionDialog {
         id: libraryDeleteDialog
-        heading: "Remove this saved identity?"
-        bodyText: "This removes the game from the key vault, so it will no longer be matched automatically. Private key files are kept on disk."
-        primaryText: "Remove identity"
+        heading: "Remove this app's update key?"
+        bodyText: "This removes the QAPKR signing identity from the connected Quest. The app stays installed, but QAPKR cannot rebuild future updates for this renamed app unless you restore the identity."
+        primaryText: "Remove from Quest"
         secondaryText: "Cancel"
         destructive: true
         onPrimaryChosen: libraryController.deleteSelected()
@@ -588,7 +588,7 @@ ApplicationWindow {
                                         anchors.rightMargin: 6
                                         spacing: 10
                                         IconImage {
-                                            width: 15; height: 15
+                                            Layout.preferredWidth: 15; Layout.preferredHeight: 15
                                             sourceSize.width: 15; sourceSize.height: 15
                                             source: Qt.resolvedUrl(attachedRow.modelData.serial.indexOf(":") >= 0
                                                                    ? "../assets/icon-wifi.svg" : "../assets/icon-usb.svg")
@@ -670,7 +670,7 @@ ApplicationWindow {
                                         anchors.rightMargin: 6
                                         spacing: 10
                                         IconImage {
-                                            width: 15; height: 15
+                                            Layout.preferredWidth: 15; Layout.preferredHeight: 15
                                             sourceSize.width: 15; sourceSize.height: 15
                                             source: Qt.resolvedUrl("../assets/icon-wifi.svg")
                                             color: savedRowItem.isCurrent ? "#70b18f" : "#a9a9a9"
@@ -1632,88 +1632,23 @@ ApplicationWindow {
                                     Layout.fillWidth: true
                                     text: libraryController.actionText
                                           ? libraryController.actionText
-                                          : libraryController.showInstalled
-                                          ? "Select an installed app, then choose the APK or complete game folder to update it."
-                                          : "Signing identities are restored automatically when you choose a matching game on Dashboard."
+                                          : "Select an installed app, then choose its newer APK or complete game folder."
                                     color: libraryController.actionText ? "#aebdca" : window.textSecondary
                                     font.pixelSize: 10
                                     elide: Text.ElideRight
                                 }
                             }
                             Item {
-                                visible: !libraryController.showInstalled
-                                Layout.preferredWidth: 238
-                                Layout.preferredHeight: 36
-                                RowLayout {
-                                    anchors.fill: parent
-                                    spacing: 6
-                                    AppButton {
-                                        Layout.fillWidth: true
-                                        text: "Copy all"
-                                        leftPadding: 9
-                                        rightPadding: 9
-                                        font.pixelSize: 11
-                                        enabled: !libraryController.isEmpty
-                                                 && !libraryController.archiveBusy
-                                        onClicked: libraryController.copyAllInformation()
-                                    }
-                                    AppButton {
-                                        Layout.fillWidth: true
-                                        text: "Export all"
-                                        leftPadding: 9
-                                        rightPadding: 9
-                                        font.pixelSize: 11
-                                        enabled: !libraryController.isEmpty
-                                                 && !libraryController.archiveBusy
-                                        onClicked: fileDialogController.saveLibraryArchive(
-                                            "libraryExportAll",
-                                            "Export all saved identities and private keys",
-                                            "Quest APK Renamer Library.qarlib",
-                                            libraryController.libraryPath
-                                        )
-                                    }
-                                    AppButton {
-                                        Layout.fillWidth: true
-                                        text: "Import"
-                                        leftPadding: 9
-                                        rightPadding: 9
-                                        font.pixelSize: 11
-                                        enabled: !libraryController.archiveBusy
-                                        onClicked: fileDialogController.chooseLibraryArchive(
-                                            "libraryImport",
-                                            "Import saved identities and private keys",
-                                            libraryController.libraryPath
-                                        )
-                                    }
-                                }
-                            }
-                            Text {
-                                text: "Headset"
-                                color: libraryController.showInstalled
-                                       ? window.textPrimary : window.textSecondary
-                                font.pixelSize: 10
-                            }
-                            AppSwitch {
-                                checked: libraryController.showInstalled
-                                enabled: !appController.isBusy
-                                         && !libraryController.archiveBusy
-                                Accessible.name: "Show apps installed on headset"
-                                ToolTip.visible: hovered
-                                ToolTip.delay: 500
-                                ToolTip.text: "Switch between the connected headset's apps and the saved signing-key vault"
-                                onToggled: libraryController.setShowInstalled(checked)
-                            }
-                            Item {
                                 Layout.preferredWidth: 88
                                 Layout.preferredHeight: 36
                                 AppButton {
                                     anchors.fill: parent
-                                    visible: libraryController.showInstalled
                                     text: libraryController.isLoading ? "Refreshing…" : "Refresh"
                                     primary: true
                                     enabled: libraryController.isConnected
                                              && !libraryController.isLoading
                                              && !appController.isBusy
+                                             && !bulkController.isBusy
                                     onClicked: libraryController.refresh()
                                 }
                             }
@@ -1733,16 +1668,14 @@ ApplicationWindow {
                                 width: Math.min(parent.width - 70, 480)
                                 spacing: 12
                                 BusyIndicator {
-                                    visible: libraryController.showInstalled
-                                             && libraryController.isLoading
+                                    visible: libraryController.isLoading
                                     running: visible
                                     Layout.alignment: Qt.AlignHCenter
                                     Layout.preferredWidth: 30
                                     Layout.preferredHeight: 30
                                 }
                                 Rectangle {
-                                    visible: !libraryController.showInstalled
-                                             || !libraryController.isLoading
+                                    visible: !libraryController.isLoading
                                     Layout.alignment: Qt.AlignHCenter
                                     Layout.preferredWidth: 34
                                     Layout.preferredHeight: 34
@@ -1750,9 +1683,7 @@ ApplicationWindow {
                                     color: "#24242a"
                                     Text {
                                         anchors.centerIn: parent
-                                        text: !libraryController.showInstalled
-                                              ? "•"
-                                              : libraryController.isConnected ? "•" : "—"
+                                        text: libraryController.isConnected ? "•" : "—"
                                         color: libraryController.errorMessage ? "#e3b74a" : "#777777"
                                         font.pixelSize: 18
                                     }
@@ -1767,12 +1698,9 @@ ApplicationWindow {
                                     wrapMode: Text.WordWrap
                                 }
                                 Text {
-                                    visible: !libraryController.showInstalled
-                                             || !libraryController.isLoading
+                                    visible: !libraryController.isLoading
                                     Layout.fillWidth: true
-                                    text: !libraryController.showInstalled
-                                          ? "Build a signed game and its app ID and signing key will be saved here automatically."
-                                          : !libraryController.isConnected
+                                    text: !libraryController.isConnected
                                           ? "Keep the headset awake and approve USB debugging when prompted."
                                           : libraryController.errorMessage
                                           ? "The rest of the app is still available. Reconnect the headset or try again."
@@ -1783,12 +1711,12 @@ ApplicationWindow {
                                     wrapMode: Text.WordWrap
                                 }
                                 AppButton {
-                                    visible: libraryController.showInstalled
-                                             && libraryController.isConnected
+                                    visible: libraryController.isConnected
                                              && !libraryController.isLoading
                                     Layout.alignment: Qt.AlignHCenter
                                     text: "Try again"
                                     primary: Boolean(libraryController.errorMessage)
+                                    enabled: !appController.isBusy && !bulkController.isBusy
                                     onClicked: libraryController.refresh()
                                 }
                             }
@@ -1811,7 +1739,7 @@ ApplicationWindow {
                                 delegate: Rectangle {
                                             required property var modelData
                                             width: libraryList.width
-                                            height: libraryController.showInstalled ? 86 : 94
+                                            height: 86
                                             color: libraryController.selectedId === modelData.id
                                                    ? "#24242a"
                                                    : rowMouse.containsMouse ? "#202025" : "transparent"
@@ -1877,16 +1805,12 @@ ApplicationWindow {
                                                             implicitWidth: libraryStatus.implicitWidth + 16
                                                             implicitHeight: 22
                                                             radius: 11
-                                                            color: libraryController.showInstalled
-                                                                   ? (modelData.managed ? "#263b32" : "#2e2e35")
-                                                                   : (modelData.keyReady ? "#263b32" : "#332e14")
+                                                            color: modelData.managed ? "#263b32" : "#2e2e35"
                                                             Text {
                                                                 id: libraryStatus
                                                                 anchors.centerIn: parent
                                                                 text: modelData.status
-                                                                color: libraryController.showInstalled
-                                                                       ? (modelData.managed ? "#78b894" : "#a8a8a8")
-                                                                       : (modelData.keyReady ? "#78b894" : "#e3b74a")
+                                                                color: modelData.managed ? "#78b894" : "#a8a8a8"
                                                                 font.pixelSize: 9
                                                                 font.weight: Font.DemiBold
                                                             }
@@ -1894,18 +1818,8 @@ ApplicationWindow {
                                                     }
                                                     Text {
                                                         Layout.fillWidth: true
-                                                        text: libraryController.showInstalled
-                                                              ? modelData.targetPackage
-                                                              : "Original   " + modelData.originalPackage
+                                                        text: modelData.targetPackage
                                                         color: window.textSecondary
-                                                        font.pixelSize: 10
-                                                        elide: Text.ElideMiddle
-                                                    }
-                                                    Text {
-                                                        visible: !libraryController.showInstalled
-                                                        Layout.fillWidth: true
-                                                        text: "Renamed  " + modelData.targetPackage
-                                                        color: "#b9b9b9"
                                                         font.pixelSize: 10
                                                         elide: Text.ElideMiddle
                                                     }
@@ -1922,16 +1836,13 @@ ApplicationWindow {
                                                     Text {
                                                         Layout.alignment: Qt.AlignRight
                                                         text: modelData.keyStatus
-                                                        color: !libraryController.showInstalled
-                                                               ? (modelData.keyReady ? "#78b894" : "#e3b74a")
-                                                               : modelData.managed
+                                                        color: modelData.managed
                                                                ? (modelData.keyReady ? "#78b894" : "#e3b74a")
                                                                : "#888888"
                                                         font.pixelSize: 10
                                                     }
                                                 }
                                                 AppButton {
-                                                    visible: libraryController.showInstalled
                                                     text: "Select"
                                                     primary: libraryController.selectedId === modelData.id
                                                     enabled: !appController.isBusy
@@ -1941,7 +1852,7 @@ ApplicationWindow {
                                             MouseArea {
                                                 id: rowMouse
                                                 anchors.fill: parent
-                                                anchors.rightMargin: libraryController.showInstalled ? 92 : 0
+                                                anchors.rightMargin: 92
                                                 enabled: true
                                                 hoverEnabled: true
                                                 cursorShape: enabled ? Qt.PointingHandCursor : Qt.ArrowCursor
@@ -1952,109 +1863,10 @@ ApplicationWindow {
                         }
 
                         Rectangle {
-                            visible: !libraryController.showInstalled
-                                     && !libraryController.isEmpty
-                            Layout.fillWidth: true
-                            Layout.preferredHeight: visible ? 144 : 0
-                            radius: 3
-                            color: window.panel
-                            border.width: 1
-                            border.color: window.line
-                            RowLayout {
-                                anchors.fill: parent
-                                anchors.margins: 15
-                                spacing: 18
-                                ColumnLayout {
-                                    Layout.fillWidth: true
-                                    spacing: 4
-                                    Text {
-                                        text: (libraryController.selected.gameName || "SAVED IDENTITY").toUpperCase()
-                                        color: "#777777"
-                                        font.pixelSize: 9
-                                        font.weight: Font.DemiBold
-                                        font.letterSpacing: 1
-                                    }
-                                    Text {
-                                        Layout.fillWidth: true
-                                        text: (libraryController.selected.originalPackage || "")
-                                              + "  →  "
-                                              + (libraryController.selected.targetPackage || "")
-                                        color: window.textPrimary
-                                        font.pixelSize: 12
-                                        font.weight: Font.Medium
-                                        elide: Text.ElideMiddle
-                                    }
-                                    Text {
-                                        Layout.fillWidth: true
-                                        text: (libraryController.selected.keyStatus || "")
-                                              + (libraryController.selected.keySha256
-                                                 ? "  •  SHA-256 " + libraryController.selected.keySha256
-                                                 : "")
-                                        color: libraryController.selected.keyReady ? "#78b894" : "#e3b74a"
-                                        font.pixelSize: 10
-                                        elide: Text.ElideMiddle
-                                    }
-                                    Text {
-                                        Layout.fillWidth: true
-                                        text: libraryController.selected.keyPath || "No signing-key file is saved."
-                                        color: window.textSecondary
-                                        font.pixelSize: 10
-                                        elide: Text.ElideMiddle
-                                    }
-                                    Text {
-                                        Layout.fillWidth: true
-                                        text: "This app ID and signing identity are reused automatically when a matching source is selected."
-                                        color: window.textSecondary
-                                        font.pixelSize: 10
-                                        wrapMode: Text.WordWrap
-                                    }
-                                }
-                                GridLayout {
-                                    Layout.preferredWidth: 280
-                                    columns: 2
-                                    columnSpacing: 7
-                                    rowSpacing: 7
-                                    AppButton {
-                                        Layout.fillWidth: true
-                                        text: "Copy info"
-                                        enabled: !libraryController.archiveBusy
-                                        onClicked: libraryController.copySelectedInformation()
-                                    }
-                                    AppButton {
-                                        Layout.fillWidth: true
-                                        text: "Export identity"
-                                        enabled: !libraryController.archiveBusy
-                                        onClicked: fileDialogController.saveLibraryArchive(
-                                            "libraryExportSelected",
-                                            "Export this saved identity and private key",
-                                            (libraryController.selected.targetPackage || "Saved identity") + ".qarlib",
-                                            libraryController.libraryPath
-                                        )
-                                    }
-                                    AppButton {
-                                        Layout.fillWidth: true
-                                        text: "Open key folder"
-                                        enabled: Boolean(libraryController.selected.keyPath)
-                                                 && !libraryController.archiveBusy
-                                        onClicked: libraryController.openSelectedKeyFolder()
-                                    }
-                                    AppButton {
-                                        Layout.fillWidth: true
-                                        text: "Remove"
-                                        danger: true
-                                        enabled: !libraryController.archiveBusy
-                                        onClicked: libraryDeleteDialog.open()
-                                    }
-                                }
-                            }
-                        }
-
-                        Rectangle {
-                            visible: libraryController.showInstalled
-                                     && !libraryController.isEmpty
+                            visible: !libraryController.isEmpty
                                      && libraryController.isConnected
                             Layout.fillWidth: true
-                            Layout.preferredHeight: visible ? 122 : 0
+                            Layout.preferredHeight: visible ? 160 : 0
                             radius: 3
                             color: window.panel
                             border.width: 1
@@ -2082,8 +1894,10 @@ ApplicationWindow {
                                     }
                                     Text {
                                         Layout.fillWidth: true
-                                        text: libraryController.selected.managed
-                                              ? "The app will be rebuilt with its saved identity before installation."
+                                        text: libraryController.selected.identityError
+                                              ? "Fix or remove the damaged QAPKR identity before rebuilding this renamed app."
+                                              : libraryController.selected.managed
+                                              ? "The app will be rebuilt with the update key associated with this Quest."
                                               : "The APK is installed unchanged so Android can verify its signature. Choose a folder to include OBB files."
                                         color: window.textSecondary
                                         font.pixelSize: 10
@@ -2092,11 +1906,45 @@ ApplicationWindow {
                                 }
                                 ColumnLayout {
                                     spacing: 8
+                                    RowLayout {
+                                        Layout.fillWidth: true
+                                        spacing: 7
+                                        AppButton {
+                                            visible: Boolean(libraryController.selected.storedOnQuest)
+                                            text: "Export key…"
+                                            enabled: !libraryController.archiveBusy
+                                            onClicked: fileDialogController.saveLibraryArchive(
+                                                "libraryExportSelected",
+                                                "Export this app's update identity",
+                                                (libraryController.selected.targetPackage || "QAPKR identity") + ".qarlib",
+                                                libraryController.libraryPath
+                                            )
+                                        }
+                                        AppButton {
+                                            text: libraryController.selected.storedOnQuest
+                                                  ? "Replace key…" : "Restore key…"
+                                            enabled: !libraryController.archiveBusy
+                                            onClicked: fileDialogController.chooseLibraryArchive(
+                                                "libraryImport",
+                                                "Restore the selected app's QAPKR identity",
+                                                libraryController.libraryPath
+                                            )
+                                        }
+                                        AppButton {
+                                            visible: Boolean(libraryController.selected.storedOnQuest)
+                                                     || Boolean(libraryController.selected.identityError)
+                                            text: "Remove key"
+                                            danger: true
+                                            enabled: !libraryController.archiveBusy
+                                            onClicked: libraryDeleteDialog.open()
+                                        }
+                                    }
                                     AppButton {
                                         Layout.fillWidth: true
                                         text: "Choose update APK…"
                                         enabled: libraryController.selectedId
                                                  && !appController.isBusy
+                                                 && !libraryController.selected.identityError
                                         onClicked: {
                                             appController.prepareLibraryUpdate(libraryController.selectedId)
                                             fileDialogController.chooseApk(
@@ -2112,6 +1960,7 @@ ApplicationWindow {
                                         primary: true
                                         enabled: libraryController.selectedId
                                                  && !appController.isBusy
+                                                 && !libraryController.selected.identityError
                                         onClicked: {
                                             appController.prepareLibraryUpdate(libraryController.selectedId)
                                             fileDialogController.chooseFolder(
@@ -2645,7 +2494,7 @@ ApplicationWindow {
                                     SettingRow {
                                         Layout.fillWidth: true
                                         title: "Sign completed APKs"
-                                        detail: "Use the persistent Quest APK Renamer signing identity"
+                                        detail: "Create or reuse the selected app's update identity"
                                         checked: appController.settings.signApks
                                         onChanged: value => appController.setSetting("sign_apks", value)
                                     }
@@ -2872,6 +2721,7 @@ ApplicationWindow {
                                         }
                                     }
                                     SettingRow {
+                                        visible: false
                                         Layout.fillWidth: true
                                         title: "Signing-key backup reminder"
                                         detail: "Remind me until the persistent key is backed up"
@@ -2882,6 +2732,7 @@ ApplicationWindow {
                             }
 
                             Panel {
+                                visible: false
                                 Layout.fillWidth: true
                                 Layout.preferredHeight: signingColumn.implicitHeight + 36
                                 ColumnLayout {

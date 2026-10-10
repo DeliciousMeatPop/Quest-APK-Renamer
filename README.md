@@ -35,9 +35,9 @@ The renamed APK and OBB files are saved in a separate ` - Renamed` folder. Your 
 - Automatic Quest detection
 - APK Inspector
 - Bulk APK rename/install queue
-- Installed game Library
-- Saved signing identities for future updates
-- Signing identity backup and restore
+- Live Library of apps installed on the connected Quest
+- Per-app update identities stored on the connected Quest
+- Per-app signing identity export, restore, replacement, and removal
 - Automatic Android tool checks and repair
 - Build and installation progress
 - Detailed logs and support information
@@ -47,9 +47,9 @@ You can connect using USB or wireless ADB.
 Connect the Quest over USB first and use **Enable wireless ADB over USB** to switch it to Wi-Fi. Saved Quest addresses can then be reconnected from the app.
 You can also manually add an `ip:port` address from the Quest's Wireless Debugging screen.
 ## Updating Renamed Games
-The **Library** keeps track of renamed games and their signing identities.
-When you select a newer version of the same game, Quest APK Renamer can rebuild it using the same package ID and signing key so it can update the renamed copy already installed on your headset.
-Keep a backup of your signing identity. Losing the signing key means Android will not allow future builds to update the existing renamed installation.
+The **Library** is a live view of apps installed on your connected Quest. Select an app, then choose a newer APK or complete game folder. Publisher-signed apps update directly; renamed apps are rebuilt with the update identity stored for that installation on the same headset.
+
+After a renamed install is verified, its identity is stored automatically under `/sdcard/QAPKR/identities/<package-id>`. From the selected app, you can export a private `.qarlib` recovery archive, restore or replace its identity, or remove the saved identity without uninstalling the app. Losing that identity means Android will not allow a future build to update the existing renamed installation.
 ## Platform Notes
 ### Windows
 The installer adds Quest APK Renamer to the Start Menu. SmartScreen may warn about an unknown publisher because the application is not currently code-signed.
@@ -67,7 +67,7 @@ Quest APK Renamer does not bypass:
 - DRM
 - Platform security
 Renamed APKs are re-signed with a different certificate, so they are treated by Android as separate builds.
-Keep backups of important APKs, OBB files, and your Quest APK Renamer signing identity.
+Keep backups of important APKs, OBB files, and any exported QAPKR identity archives.
 ## Problems or Bugs
 If something goes wrong, use **Copy support info** from the Logs window and [open a GitHub issue](https://github.com/NotYetFound/Quest-APK-Renamer/issues/new/choose).
 ## Run From Source

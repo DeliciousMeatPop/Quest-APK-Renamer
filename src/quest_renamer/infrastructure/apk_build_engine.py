@@ -11,6 +11,7 @@ from dataclasses import replace
 from pathlib import Path
 
 from quest_renamer.domain.build import BuildError, BuildResult, PackageRewriteReport
+from quest_renamer.domain.library import profile_id
 from quest_renamer.domain.models import BuildRequest
 from quest_renamer.domain.operations import CancellationToken, OperationCancelled
 from quest_renamer.domain.signers import (
@@ -343,8 +344,16 @@ class StagedApkBuildEngine:
                             f"previously signed by {previous_signer[0]} "
                             f"({previous_signer[1]})."
                         )
+                    identity_root = (
+                        self.signing_root
+                        / "pending-identities"
+                        / profile_id(
+                            request.source.package_name,
+                            request.package_name,
+                        )
+                    )
                     identity_store = SigningIdentityStore(
-                        self.signing_root,
+                        identity_root,
                         self.toolchain.keytool,
                         self.runner,
                     )
@@ -363,6 +372,7 @@ class StagedApkBuildEngine:
                             token=token,
                             log=log,
                             dname=signing_dname,
+                            ensure_canonical=False,
                         )
                     signing_identity = identity
                     signed.mkdir()

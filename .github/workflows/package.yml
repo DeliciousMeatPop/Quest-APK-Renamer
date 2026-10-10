@@ -33,6 +33,7 @@ jobs:
           ruff check src tests scripts
           mypy src
           pytest -q
+          pyside6-qmllint --missing-property error --unqualified disable src/quest_renamer/qml/*.qml
           quest-renamer --smoke-test
 
   linux:

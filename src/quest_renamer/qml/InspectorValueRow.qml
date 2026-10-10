@@ -30,7 +30,7 @@ Item {
             text: root.value
             color: "#d0d0d0"
             font.pixelSize: 10
-            font.family: !root.monospace ? Qt.application.font.family
+            font.family: !root.monospace ? ""
                        : Qt.platform.os === "windows" ? "Consolas"
                        : Qt.platform.os === "osx" ? "Menlo"
                        : "monospace"

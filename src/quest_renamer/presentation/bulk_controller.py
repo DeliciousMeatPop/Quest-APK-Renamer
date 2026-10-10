@@ -24,6 +24,7 @@ from PySide6.QtCore import (
 from quest_renamer.domain.analysis import ApkAnalysis
 from quest_renamer.domain.build import BuildError, BuildResult
 from quest_renamer.domain.bulk import package_with_suffix
+from quest_renamer.domain.installation import BundleInstallResult
 from quest_renamer.domain.models import BuildRequest, BundleDraft, DeviceSnapshot
 from quest_renamer.domain.operations import CancellationToken, OperationCancelled
 from quest_renamer.infrastructure.desktop_open import open_local_path
@@ -182,6 +183,8 @@ class BulkController(QObject):
     itemReady = Signal(int, object)
     progressReady = Signal(float, str)
     operationReady = Signal(object)
+    libraryBuildReady = Signal(object)
+    libraryInstallReady = Signal(object)
     activityMessage = Signal(str)
 
     def __init__(
@@ -198,6 +201,13 @@ class BulkController(QObject):
         move_to_trash: Callable[[Path], None] | None = None,
         path_opener: Callable[[Path], bool] | None = None,
         clipboard_writer: Callable[[str], bool] | None = None,
+        signing_identity: Callable[[str], tuple[Path | None, Path | None]] | None = None,
+        record_build: (
+            Callable[[BundleDraft, str, BuildResult, tuple[str, ...]], object] | None
+        ) = None,
+        record_install: (
+            Callable[[BundleDraft, BundleInstallResult, str], object] | None
+        ) = None,
         parent: QObject | None = None,
     ) -> None:
         super().__init__(parent)
@@ -213,6 +223,9 @@ class BulkController(QObject):
         self._device_snapshot = device_snapshot
         self._external_busy = external_busy or (lambda: False)
         self._move_to_trash = move_to_trash
+        self._signing_identity = signing_identity
+        self._record_build = record_build
+        self._record_install = record_install
         self._suffix = "a"
         self._suffix_error = ""
         self._replace_sources = False
@@ -229,6 +242,8 @@ class BulkController(QObject):
         self.itemReady.connect(self._apply_item)
         self.progressReady.connect(self._apply_progress)
         self.operationReady.connect(self._apply_operation)
+        self.libraryBuildReady.connect(self._apply_library_build)
+        self.libraryInstallReady.connect(self._apply_library_install)
 
     @Property(QObject, constant=True)
     def items(self) -> QObject:
@@ -642,12 +657,20 @@ class BulkController(QObject):
         )
         entries = self._model.entries()
         target = self._build_worker if mode == "build" else self._install_worker
-        threading.Thread(target=target, args=(entries, self._token), daemon=True).start()
+        identities: dict[str, tuple[Path | None, Path | None]] = {}
+        if mode == "build" and self._signing_identity is not None:
+            identities = {
+                entry.target_package: self._signing_identity(entry.target_package)
+                for entry in entries
+            }
+        args = (entries, self._token, identities) if mode == "build" else (entries, self._token)
+        threading.Thread(target=target, args=args, daemon=True).start()
 
     def _build_worker(
         self,
         entries: tuple[BulkEntry, ...],
         token: CancellationToken,
+        identities: dict[str, tuple[Path | None, Path | None]],
     ) -> None:
         settings = self._settings_store.load()
         rows = [(row, item) for row, item in enumerate(entries) if not item.built]
@@ -695,6 +718,8 @@ class BulkController(QObject):
                     settings.label_suffix if settings.change_display_name else ""
                 ),
                 rename_java_packages=settings.rename_java_packages,
+                signing_keystore=identities.get(entry.target_package, (None, None))[0],
+                signing_metadata=identities.get(entry.target_package, (None, None))[1],
             )
             try:
                 preflight = self._preflight_service.check(
@@ -733,6 +758,9 @@ class BulkController(QObject):
                     token=token,
                     progress=progress,
                     log=log_build,
+                )
+                self.libraryBuildReady.emit(
+                    (entry.source, entry.target_package, result, request.patches)
                 )
                 finished = self._bundle_from_result(entry, result)
                 completed = replace(
@@ -833,7 +861,7 @@ class BulkController(QObject):
                 def log_install(message: str, name: str = entry.bundle.root.name) -> None:
                     self.activityMessage.emit(f"Bulk install {name}: {message}")
 
-                self._bundle_installer.install_bundle(
+                result = self._bundle_installer.install_bundle(
                     entry.bundle,
                     device.serial,
                     token=token,
@@ -841,6 +869,7 @@ class BulkController(QObject):
                     log=log_install,
                     allow_existing=True,
                 )
+                self.libraryInstallReady.emit((entry.bundle, result, device.serial))
                 cleanup_detail = ""
                 tone = "success"
                 if self._cleanup_after_install:
@@ -886,6 +915,39 @@ class BulkController(QObject):
         self.operationReady.emit(
             BulkOperationOutcome("install", successes, failures, cancelled, tuple(details))
         )
+
+    @Slot(object)
+    def _apply_library_build(self, raw: object) -> None:
+        if self._record_build is None or not isinstance(raw, tuple) or len(raw) != 4:
+            return
+        source, target_package, result, patches = raw
+        if (
+            not isinstance(source, BundleDraft)
+            or not isinstance(target_package, str)
+            or not isinstance(result, BuildResult)
+            or not isinstance(patches, tuple)
+        ):
+            return
+        try:
+            self._record_build(source, target_package, result, patches)
+        except Exception as exc:  # Bookkeeping must not break the Qt event loop.
+            self.activityMessage.emit(f"Bulk identity record could not be saved: {exc}")
+
+    @Slot(object)
+    def _apply_library_install(self, raw: object) -> None:
+        if self._record_install is None or not isinstance(raw, tuple) or len(raw) != 3:
+            return
+        bundle, result, serial = raw
+        if (
+            not isinstance(bundle, BundleDraft)
+            or not isinstance(result, BundleInstallResult)
+            or not isinstance(serial, str)
+        ):
+            return
+        try:
+            self._record_install(bundle, result, serial)
+        except Exception as exc:  # The verified install remains valid if recording fails.
+            self.activityMessage.emit(f"Bulk installed app record could not be saved: {exc}")
 
     @Slot(int, object)
     def _apply_item(self, row: int, raw_entry: object) -> None:

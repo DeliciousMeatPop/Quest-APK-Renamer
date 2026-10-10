@@ -13,7 +13,12 @@ from PySide6.QtGui import QGuiApplication
 
 from quest_renamer.domain.build import BuildResult
 from quest_renamer.domain.installation import BundleInstallResult
-from quest_renamer.domain.library import GameProfile, LibraryObb, profile_id
+from quest_renamer.domain.library import (
+    GameProfile,
+    LibraryObb,
+    QuestIdentityRecord,
+    profile_id,
+)
 from quest_renamer.domain.models import BundleDraft, DeviceSnapshot, InstalledQuestApp
 from quest_renamer.infrastructure.app_icons import cache_apk_icon, display_name_key
 from quest_renamer.infrastructure.desktop_open import open_local_path
@@ -25,6 +30,7 @@ from quest_renamer.infrastructure.library_archive import (
     inspect_library_archive,
 )
 from quest_renamer.infrastructure.library_store import GameLibraryStore
+from quest_renamer.infrastructure.quest_identity_store import QuestIdentityStore
 
 ClipboardWriter = Callable[[str], bool]
 
@@ -47,6 +53,7 @@ class LibraryController(QObject):
     activityMessage = Signal(str)
     inventoryReady = Signal(int, str, object, str)
     archiveReady = Signal(str, object, str)
+    identityOperationReady = Signal(str, object, str)
     importConfirmationRequested = Signal(str)
 
     def __init__(
@@ -55,6 +62,7 @@ class LibraryController(QObject):
         *,
         signing_root: Path,
         installed_apps: Callable[[str], tuple[InstalledQuestApp, ...]] | None = None,
+        device_identities: QuestIdentityStore | None = None,
         path_opener: Callable[[Path], bool] | None = None,
         clipboard_writer: ClipboardWriter | None = None,
         parent: QObject | None = None,
@@ -64,14 +72,20 @@ class LibraryController(QObject):
         self._signing_root = signing_root
         self._icon_root = signing_root / "app-icons"
         self._installed_apps_reader = installed_apps
+        self._device_identities = device_identities
         self._path_opener = path_opener or open_local_path
         self._clipboard_writer = clipboard_writer or _write_system_clipboard
-        self._profiles = store.load()
+        self._local_profiles = store.load()
+        self._device_profiles: tuple[GameProfile, ...] = ()
+        self._session_profiles: dict[str, GameProfile] = {}
+        # Old desktop profiles are migration candidates, not a second Library.
+        # They become active only when their renamed package is installed on the
+        # currently connected headset.
+        self._profiles: tuple[GameProfile, ...] = ()
         self._apps: tuple[InstalledQuestApp, ...] = ()
-        self._selected_profile_id = self._profiles[0].id if self._profiles else ""
+        self._selected_profile_id = ""
         self._selected_package = ""
         self._show_installed = True
-        self._user_chose_view = False
         self._connected = False
         self._device_serial = ""
         self._device_model = ""
@@ -80,6 +94,7 @@ class LibraryController(QObject):
         self._error = ""
         self._action_text = ""
         self._archive_busy = False
+        self._identity_operations = 0
         self._pending_archive: Path | None = None
         self._scan_generation = 0
         self._profiles_by_id: dict[str, GameProfile] = {}
@@ -88,18 +103,18 @@ class LibraryController(QObject):
         self._display_profiles: dict[str, GameProfile] = {}
         self._apps_by_package: dict[str, InstalledQuestApp] = {}
         self._key_health: dict[str, bool] = {}
+        self._identity_errors: dict[str, str] = {}
         self._icons_by_name: dict[str, str] = {}
-        self._saved_rows: list[dict[str, str | bool]] = []
-        self._saved_rows_by_id: dict[str, dict[str, str | bool]] = {}
         self._installed_rows: list[dict[str, str | bool]] = []
         self._installed_rows_by_id: dict[str, dict[str, str | bool]] = {}
         self._refresh_profile_cache()
         self.inventoryReady.connect(self._apply_inventory)
         self.archiveReady.connect(self._apply_archive_result)
+        self.identityOperationReady.connect(self._apply_identity_operation)
 
     @Property(list, notify=rowsChanged)
     def rows(self) -> list[dict[str, str | bool]]:
-        return self._installed_rows if self._show_installed else self._saved_rows
+        return self._installed_rows
 
     def _emit_rows(self) -> None:
         self.rowsChanged.emit()
@@ -111,25 +126,21 @@ class LibraryController(QObject):
 
     @Property(int, notify=changed)
     def count(self) -> int:
-        return len(self._apps) if self._show_installed else len(self._profiles)
+        return len(self._apps)
 
     @Property(bool, notify=changed)
     def isEmpty(self) -> bool:
-        return not self._apps if self._show_installed else not self._profiles
+        return not self._apps
 
     @Property(bool, notify=changed)
     def showInstalled(self) -> bool:
-        return self._show_installed
+        return True
 
     @Slot(bool)
     def setShowInstalled(self, enabled: bool) -> None:
-        enabled = bool(enabled)
-        if enabled == self._show_installed:
-            return
-        self._show_installed = enabled
-        self._user_chose_view = True
-        self._action_text = ""
-        self._emit_rows()
+        # Kept as a compatibility no-op for older QML/tests. Library is now a
+        # connected-headset view; private identities are not a second UI mode.
+        del enabled
 
     @Property(bool, notify=changed)
     def isConnected(self) -> bool:
@@ -149,7 +160,7 @@ class LibraryController(QObject):
 
     @Property(bool, notify=changed)
     def archiveBusy(self) -> bool:
-        return self._archive_busy
+        return self._archive_busy or self._identity_operations > 0
 
     @Property(str, notify=changed)
     def deviceLabel(self) -> str:
@@ -157,9 +168,6 @@ class LibraryController(QObject):
 
     @Property(str, notify=changed)
     def statusText(self) -> str:
-        if not self._show_installed:
-            noun = "signing identity" if len(self._profiles) == 1 else "signing identities"
-            return f"{len(self._profiles)} saved {noun}"
         if not self._connected:
             return "Connect and authorize a Quest to view its installed apps."
         if self._loading:
@@ -173,13 +181,11 @@ class LibraryController(QObject):
 
     @Property(str, notify=changed)
     def selectedId(self) -> str:
-        return self._selected_package if self._show_installed else self._selected_profile_id
+        return self._selected_package
 
     @Property(dict, notify=changed)
     def selected(self) -> dict[str, str | bool]:
-        rows = self._installed_rows_by_id if self._show_installed else self._saved_rows_by_id
-        selected = self._selected_package if self._show_installed else self._selected_profile_id
-        return rows.get(selected, {})
+        return self._installed_rows_by_id.get(self._selected_package, {})
 
     @Property(str, constant=True)
     def libraryPath(self) -> str:
@@ -223,6 +229,9 @@ class LibraryController(QObject):
         app = self.installed_app(package_name)
         return app.version_code if app is not None else ""
 
+    def identity_error(self, package_name: str) -> str:
+        return self._identity_errors.get(package_name, "")
+
     def profiles_for_source(self, original_package: str) -> tuple[GameProfile, ...]:
         return self._profiles_by_source.get(original_package, ())
 
@@ -236,25 +245,20 @@ class LibraryController(QObject):
 
     @Slot(str)
     def select(self, entry_id: str) -> None:
-        if self._show_installed:
-            if self.installed_app(entry_id) is None or entry_id == self._selected_package:
-                return
-            self._selected_package = entry_id
-        else:
-            if self.profile(entry_id) is None or entry_id == self._selected_profile_id:
-                return
-            self._selected_profile_id = entry_id
+        if self.installed_app(entry_id) is None or entry_id == self._selected_package:
+            return
+        self._selected_package = entry_id
         self._action_text = ""
         self.changed.emit()
 
     @Slot(int)
     def selectOffset(self, offset: int) -> None:
         """Move the selection up or down by ``offset`` rows (keyboard navigation)."""
-        rows = self._installed_rows if self._show_installed else self._saved_rows
+        rows = self._installed_rows
         if not rows:
             return
         ids = [str(row["id"]) for row in rows]
-        current = self._selected_package if self._show_installed else self._selected_profile_id
+        current = self._selected_package
         index = ids.index(current) if current in ids else -1
         target = max(0, min(len(ids) - 1, index + offset if index >= 0 else 0))
         self.select(ids[target])
@@ -273,12 +277,13 @@ class LibraryController(QObject):
             )
             self._scan_generation += 1
             self._connected = False
-            # A fresh connection later may pick the live view again.
-            self._user_chose_view = False
             self._device_serial = ""
             self._device_model = ""
             self._loaded_serial = ""
             self._apps = ()
+            self._device_profiles = ()
+            self._identity_errors = {}
+            self._rebuild_profiles()
             self._refresh_app_cache()
             self._selected_package = ""
             self._loading = False
@@ -295,12 +300,12 @@ class LibraryController(QObject):
             self._scan_generation += 1
             self._loaded_serial = ""
             self._apps = ()
-            self._refresh_app_cache()
+            self._device_profiles = ()
+            self._identity_errors = {}
+            self._rebuild_profiles()
             self._selected_package = ""
             self._loading = False
             self._error = ""
-            if not self._user_chose_view:
-                self._show_installed = True
         if new_device or model_changed:
             self._emit_rows()
         if new_device or self._loaded_serial != raw_snapshot.serial:
@@ -332,13 +337,23 @@ class LibraryController(QObject):
         try:
             assert self._installed_apps_reader is not None
             apps = self._installed_apps_reader(serial)
+            identities = (
+                self._device_identities.load(
+                    serial,
+                    {app.package_name for app in apps},
+                )
+                if self._device_identities is not None
+                else ()
+            )
         except OSError as exc:
             apps = ()
+            identities = ()
             error = str(exc)
         except Exception as exc:  # Keep an adapter failure out of the Qt event loop.
             apps = ()
+            identities = ()
             error = f"Installed apps could not be read: {exc}"
-        self.inventoryReady.emit(generation, serial, apps, error)
+        self.inventoryReady.emit(generation, serial, (apps, identities), error)
 
     @Slot(int, str, object, str)
     def _apply_inventory(
@@ -350,15 +365,33 @@ class LibraryController(QObject):
     ) -> None:
         if generation != self._scan_generation or serial != self._device_serial:
             return
+        raw_inventory: object = ()
+        raw_identities: object = ()
+        if isinstance(raw_apps, tuple) and len(raw_apps) == 2:
+            raw_inventory, raw_identities = raw_apps
+        else:
+            raw_inventory = raw_apps
         apps = (
-            tuple(item for item in raw_apps if isinstance(item, InstalledQuestApp))
-            if isinstance(raw_apps, (tuple, list))
+            tuple(item for item in raw_inventory if isinstance(item, InstalledQuestApp))
+            if isinstance(raw_inventory, (tuple, list))
+            else ()
+        )
+        identities = (
+            tuple(item for item in raw_identities if isinstance(item, QuestIdentityRecord))
+            if isinstance(raw_identities, (tuple, list))
             else ()
         )
         self._loading = False
         self._error = error
         if not error:
             self._apps = tuple(sorted(apps, key=lambda app: app.package_name.casefold()))
+            self._device_profiles = tuple(
+                record.profile for record in identities if record.profile is not None
+            )
+            self._identity_errors = {
+                record.package_name: record.error for record in identities if record.error
+            }
+            self._rebuild_profiles()
             self._refresh_app_cache()
             self._loaded_serial = serial
             if self.installed_app(self._selected_package) is None:
@@ -405,7 +438,7 @@ class LibraryController(QObject):
 
     @Slot()
     def copySelectedInformation(self) -> None:
-        profile = self.profile(self._selected_profile_id)
+        profile = self.profile_for_installed(self._selected_package)
         if profile is None:
             self._set_action("Select a saved identity first.")
             return
@@ -480,7 +513,7 @@ class LibraryController(QObject):
 
     @Slot(QUrl)
     def exportSelected(self, url: QUrl) -> None:
-        profile = self.profile(self._selected_profile_id)
+        profile = self.profile_for_installed(self._selected_package)
         if profile is None:
             self._set_action("Select a saved identity first.")
             return
@@ -498,7 +531,7 @@ class LibraryController(QObject):
         destination: Path,
         profiles: tuple[GameProfile, ...],
     ) -> None:
-        if self._archive_busy:
+        if self.archiveBusy:
             return
         self._archive_busy = True
         self._action_text = "Creating the private Library archive…"
@@ -519,7 +552,7 @@ class LibraryController(QObject):
 
     @Slot(QUrl)
     def prepareImport(self, url: QUrl) -> None:
-        if self._archive_busy:
+        if self.archiveBusy:
             return
         source = Path(url.toLocalFile())
         existing_ids = set(self._profiles_by_id)
@@ -547,7 +580,12 @@ class LibraryController(QObject):
     @Slot()
     def confirmImport(self) -> None:
         source = self._pending_archive
-        if source is None or self._archive_busy:
+        if (
+            source is None
+            or self.archiveBusy
+            or not self._connected
+            or not self._selected_package
+        ):
             return
         self._pending_archive = None
         self._archive_busy = True
@@ -556,7 +594,12 @@ class LibraryController(QObject):
 
         def worker() -> None:
             try:
-                result: object = import_library_archive(source, self._signing_root)
+                import_root = (
+                    self._device_identities.cache_root / "imports"
+                    if self._device_identities is not None
+                    else self._signing_root / "imported-identities"
+                )
+                result: object = import_library_archive(source, import_root)
                 error = ""
             except Exception as exc:  # busy flag must always clear
                 result = None
@@ -569,24 +612,44 @@ class LibraryController(QObject):
 
     @Slot()
     def cancelImport(self) -> None:
-        if self._archive_busy:
+        if self.archiveBusy:
             return
         self._pending_archive = None
         self._set_action("Import cancelled.")
 
     @Slot()
     def deleteSelected(self) -> None:
-        profile = self.profile(self._selected_profile_id)
-        if profile is None or self._archive_busy:
+        package_name = self._selected_package
+        profile = self.profile_for_installed(package_name)
+        if (
+            self.archiveBusy
+            or self._device_identities is None
+            or not self._device_serial
+            or (profile is None and package_name not in self._identity_errors)
+        ):
+            self._set_action("This app has no QAPKR identity stored on the connected Quest.")
             return
-        self._profiles = self._store.forget(profile.id)
-        self._selected_profile_id = self._profiles[0].id if self._profiles else ""
-        self._refresh_profile_cache()
-        self._action_text = (
-            f"Removed {profile.game_name} from the vault. Its key files were kept."
-        )
-        self._emit_rows()
-        self.activityMessage.emit(f"Saved identity removed from Library: {profile.game_name}")
+        row = self._installed_rows_by_id.get(package_name, {})
+        game_name = str(row.get("gameName") or package_name)
+        self._archive_busy = True
+        self._action_text = f"Removing the QAPKR identity for {game_name}…"
+        self.changed.emit()
+        serial = self._device_serial
+
+        def worker() -> None:
+            try:
+                assert self._device_identities is not None
+                self._device_identities.delete(serial, package_name)
+                error = ""
+            except Exception as exc:
+                error = f"The identity could not be removed from the Quest: {exc}"
+            self.identityOperationReady.emit(
+                "delete",
+                (profile if profile is not None else package_name, serial),
+                error,
+            )
+
+        threading.Thread(target=worker, daemon=True).start()
 
     @Slot(str, object, str)
     def _apply_archive_result(
@@ -632,31 +695,25 @@ class LibraryController(QObject):
             imported = tuple(
                 item for item in raw_result if isinstance(item, GameProfile)
             )
-            by_id = {profile.id: profile for profile in self._profiles}
-            by_id.update({profile.id: profile for profile in imported})
-            merged = tuple(
-                sorted(by_id.values(), key=lambda item: item.updated_utc, reverse=True)
-            )
-            try:
-                self._store.save(merged)
-            except OSError as exc:
+            if len(imported) != 1:
+                self._action_text = "Choose an archive containing exactly one app identity."
+                self.changed.emit()
+                self.activityMessage.emit(self._action_text)
+                return
+            profile = imported[0]
+            if profile.target_package != self._selected_package:
                 self._action_text = (
-                    "Imported keys were preserved, but Library saving failed: "
-                    f"{exc}"
+                    "That identity belongs to a different app ID: "
+                    f"{profile.target_package}."
                 )
                 self.changed.emit()
                 self.activityMessage.emit(self._action_text)
                 return
-            self._profiles = merged
-            self._selected_profile_id = imported[0].id if imported else ""
-            self._show_installed = False
-            self._refresh_profile_cache()
-            self._action_text = (
-                f"Imported {len(imported)} saved "
-                f"{'identity' if len(imported) == 1 else 'identities'}."
-            )
+            self._session_profiles[profile.id] = profile
+            self._selected_profile_id = profile.id
+            self._rebuild_profiles()
             self._emit_rows()
-            self.activityMessage.emit(self._action_text)
+            self._store_identity_on_quest(profile, self._device_serial)
 
     def _set_action(self, message: str) -> None:
         self._action_text = message
@@ -718,6 +775,8 @@ class LibraryController(QObject):
         original_package: str = "",
     ) -> GameProfile | None:
         current = next(iter(self._profiles_by_target.get(result.package_name, ())), None)
+        if current is None:
+            current = self._pending_profile_for_bundle(bundle, result.package_name)
         original = original_package or (
             current.original_package if current is not None else result.package_name
         )
@@ -760,6 +819,7 @@ class LibraryController(QObject):
             profile = current.updated(**values)
         if profile is not None:
             self._replace(profile)
+            self._store_identity_on_quest(profile, serial)
         if self._connected:
             replacement = InstalledQuestApp(
                 result.package_name,
@@ -785,25 +845,212 @@ class LibraryController(QObject):
             self._emit_rows()
         return profile
 
+    def _pending_profile_for_bundle(
+        self,
+        bundle: BundleDraft,
+        target_package: str,
+    ) -> GameProfile | None:
+        """Recover a build's local key after an app restart.
+
+        Pending build identities stay out of the connected-headset Library until
+        their package is installed. A finished folder can still be installed
+        after restarting QAPKR, so bind it to the pending identity using its
+        exact output path or the build report shipped in that folder.
+        """
+        candidates = tuple(
+            profile
+            for profile in self._local_profiles
+            if profile.target_package == target_package and profile.key_available
+        )
+        if not candidates:
+            return None
+        try:
+            bundle_root = bundle.root.resolve()
+            exact = tuple(
+                profile
+                for profile in candidates
+                if profile.output_path
+                and Path(profile.output_path).expanduser().resolve() == bundle_root
+            )
+        except OSError:
+            exact = ()
+        if len(exact) == 1:
+            return exact[0]
+
+        packages = self._build_report_packages(bundle.root)
+        if packages is None or packages[1] != target_package:
+            return None
+        original_package = packages[0]
+        matches = tuple(
+            profile
+            for profile in candidates
+            if profile.original_package == original_package
+        )
+        return matches[0] if len(matches) == 1 else None
+
+    @staticmethod
+    def _build_report_packages(root: Path) -> tuple[str, str] | None:
+        for name in ("quest-renamer-report.json", "RENAME-REPORT.json"):
+            path = root / name
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if not isinstance(payload, dict):
+                continue
+            packages = payload.get("packages")
+            if not isinstance(packages, dict):
+                continue
+            source = packages.get("source")
+            output = packages.get("output")
+            if isinstance(source, str) and source and isinstance(output, str) and output:
+                return source, output
+        return None
+
     def _replace(self, profile: GameProfile) -> None:
-        self._profiles = self._store.upsert(profile)
-        self._refresh_profile_cache()
+        self._local_profiles = self._store.upsert(profile)
+        self._session_profiles[profile.id] = profile
+        self._rebuild_profiles()
         self._selected_profile_id = profile.id
         if self.installed_app(profile.target_package) is not None:
             self._selected_package = profile.target_package
         self._emit_rows()
 
+    def _store_identity_on_quest(self, profile: GameProfile, serial: str) -> None:
+        if self._device_identities is None or not serial or not profile.key_available:
+            return
+        self._identity_operations += 1
+        self._action_text = f"Saving {profile.game_name}'s update key on the Quest…"
+        self.changed.emit()
+
+        def worker() -> None:
+            try:
+                assert self._device_identities is not None
+                self._device_identities.save(serial, profile)
+                error = ""
+            except Exception as exc:
+                error = (
+                    "The app installed, but its update key could not be saved on "
+                    f"the Quest: {exc}"
+                )
+            self.identityOperationReady.emit("save", (profile, serial), error)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    @Slot(str, object, str)
+    def _apply_identity_operation(
+        self,
+        operation: str,
+        raw_profile: object,
+        error: str,
+    ) -> None:
+        if operation == "save":
+            self._identity_operations = max(0, self._identity_operations - 1)
+        else:
+            self._archive_busy = False
+        operation_serial = self._device_serial
+        package_name = ""
+        if (
+            isinstance(raw_profile, tuple)
+            and len(raw_profile) == 2
+            and isinstance(raw_profile[0], (GameProfile, str))
+            and isinstance(raw_profile[1], str)
+        ):
+            identity_value, operation_serial = raw_profile
+            profile = identity_value if isinstance(identity_value, GameProfile) else None
+            package_name = (
+                identity_value.target_package
+                if isinstance(identity_value, GameProfile)
+                else identity_value
+            )
+        elif isinstance(raw_profile, GameProfile):
+            profile = raw_profile
+            package_name = profile.target_package
+        else:
+            return
+        if operation_serial != self._device_serial:
+            self._action_text = (
+                "The identity operation finished on the previous headset. "
+                "Reconnect it to refresh the result."
+            )
+            self.changed.emit()
+            return
+        if error:
+            self._action_text = error
+            self.changed.emit()
+            self.activityMessage.emit(error)
+            return
+        if operation == "save":
+            if profile is None:
+                return
+            # Keep a session copy for installing the same renamed app on another
+            # headset, but retire the old computer-side durable vault entry.
+            remaining = tuple(
+                item for item in self._device_profiles if item.id != profile.id
+            )
+            self._device_profiles = (*remaining, profile)
+            self._identity_errors.pop(profile.target_package, None)
+            self._local_profiles = self._store.forget(profile.id)
+            self._rebuild_profiles()
+            self._action_text = f"Update key saved on {self.deviceLabel}."
+            self.activityMessage.emit(
+                f"QAPKR identity stored on {self.deviceLabel}: {profile.target_package}"
+            )
+        elif operation == "delete":
+            self._device_profiles = tuple(
+                item
+                for item in self._device_profiles
+                if item.target_package != package_name
+            )
+            self._session_profiles = {
+                identity: item
+                for identity, item in self._session_profiles.items()
+                if item.target_package != package_name
+            }
+            self._identity_errors.pop(package_name, None)
+            self._rebuild_profiles()
+            game_name = profile.game_name if profile is not None else package_name
+            self._action_text = (
+                f"Removed {game_name}'s QAPKR identity from {self.deviceLabel}."
+            )
+            self.activityMessage.emit(self._action_text)
+        self._emit_rows()
+
+    def _rebuild_profiles(self) -> None:
+        """Combine device identities with only useful migration/session records."""
+        installed = {app.package_name for app in self._apps}
+        local_migrations = (
+            profile
+            for profile in self._local_profiles
+            if profile.target_package in installed
+        )
+        by_id = {profile.id: profile for profile in local_migrations}
+        by_id.update(self._session_profiles)
+        # A verified headset identity always wins over an older local migration.
+        by_id.update({profile.id: profile for profile in self._device_profiles})
+        self._profiles = tuple(
+            sorted(by_id.values(), key=lambda item: item.updated_utc, reverse=True)
+        )
+        self._refresh_profile_cache()
+
     def _installed_row(self, app: InstalledQuestApp) -> dict[str, str | bool]:
         profile = self.profile_for_installed(app.package_name)
         display_profile = profile or self.display_profile_for_package(app.package_name)
-        managed = profile is not None
+        identity_error = self._identity_errors.get(app.package_name, "")
+        managed = profile is not None or bool(identity_error)
         key_ready = bool(profile and self._key_health.get(profile.id, False))
-        if managed and key_ready:
-            key_status = "Saved signing key ready"
+        device_profile_ids = {item.id for item in self._device_profiles}
+        stored_on_quest = bool(profile and profile.id in device_profile_ids)
+        if identity_error:
+            key_status = "Quest key needs attention"
+        elif managed and key_ready and stored_on_quest:
+            key_status = "Update key ready on Quest"
+        elif managed and key_ready:
+            key_status = "Local key ready to migrate"
         elif managed:
-            key_status = "Saved signing key needs attention"
+            key_status = "Update key needs attention"
         else:
-            key_status = "Original signature required"
+            key_status = "Publisher-signed"
         if app.version_name and app.version_code:
             version_text = f"{app.version_name}  (code {app.version_code})"
         elif app.version_name:
@@ -843,9 +1090,21 @@ class LibraryController(QObject):
             "keySha256": profile.signing_key_sha256 if profile else "",
             "installed": True,
             "managed": managed,
-            "status": "Saved identity" if managed else "Direct update",
+            "status": (
+                "Key issue"
+                if identity_error
+                else "Managed"
+                if managed
+                else "Direct update"
+            ),
+            "identityError": identity_error,
+            "storedOnQuest": stored_on_quest,
             "updateHelp": (
-                "The saved app ID and signing key will be reused automatically."
+                identity_error
+                if identity_error
+                else "The app will be rebuilt with the update key stored on this Quest."
+                if stored_on_quest
+                else "The existing update key will move to this Quest after a verified install."
                 if managed
                 else "Choose an update with this exact package ID and its original signature."
             ),
@@ -864,49 +1123,6 @@ class LibraryController(QObject):
         if preferred and Path(preferred).is_file():
             return preferred
         return cached
-
-    def _saved_row(self, profile: GameProfile) -> dict[str, str | bool]:
-        key_ready = self._key_health.get(profile.id, False)
-        key_status = "Key ready" if key_ready else "Key missing or changed"
-        if not profile.signing_keystore and not profile.signing_metadata:
-            key_status = "No saved key"
-        status = (
-            "Ready"
-            if key_ready
-            else "No key"
-            if not profile.signing_keystore and not profile.signing_metadata
-            else "Needs attention"
-        )
-        return {
-            "id": profile.id,
-            "profileId": profile.id,
-            "gameName": profile.game_name,
-            "iconUrl": self._icon_url(
-                self._shared_icon_path(profile.game_name, profile.app_icon)
-            ),
-            "originalPackage": profile.original_package,
-            "targetPackage": profile.target_package,
-            "identity": f"{profile.original_package}  →  {profile.target_package}",
-            "version": "",
-            "versionName": "",
-            "versionText": (
-                f"Key SHA-256 {profile.signing_key_sha256[:12]}…"
-                if profile.signing_key_sha256
-                else ""
-            ),
-            "sourcePath": profile.source_path,
-            "outputPath": profile.output_path,
-            "keyStatus": key_status,
-            "keyReady": key_ready,
-            "keyPath": profile.signing_keystore,
-            "metadataPath": profile.signing_metadata,
-            "keySha256": profile.signing_key_sha256,
-            "installed": False,
-            "managed": True,
-            "status": status,
-            "updateHelp": "",
-            "selected": False,
-        }
 
     def _refresh_profile_cache(self) -> None:
         by_source: dict[str, list[GameProfile]] = {}
@@ -934,8 +1150,6 @@ class LibraryController(QObject):
         self._display_profiles = display_profiles
         self._key_health = key_health
         self._icons_by_name = icons
-        self._saved_rows = [self._saved_row(profile) for profile in self._profiles]
-        self._saved_rows_by_id = {str(row["id"]): row for row in self._saved_rows}
         self._refresh_app_cache()
 
     def _refresh_app_cache(self) -> None:

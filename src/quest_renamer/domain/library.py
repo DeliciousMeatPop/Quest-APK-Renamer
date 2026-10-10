@@ -177,3 +177,17 @@ class GameProfile:
             return hashlib.sha256(keystore.read_bytes()).hexdigest() == self.signing_key_sha256
         except OSError:
             return False
+
+
+@dataclass(frozen=True, slots=True)
+class QuestIdentityRecord:
+    """One QAPKR identity discovered on a connected headset.
+
+    ``profile`` is materialized into the desktop cache only for the current
+    connection. An error record deliberately remains visible so a broken key is
+    never mistaken for an ordinary publisher-signed app.
+    """
+
+    package_name: str
+    profile: GameProfile | None = None
+    error: str = ""

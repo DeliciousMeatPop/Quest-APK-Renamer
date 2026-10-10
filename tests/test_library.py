@@ -9,7 +9,7 @@ from PySide6.QtCore import QCoreApplication, QUrl
 from quest_renamer.domain.analysis import ApkAnalysis
 from quest_renamer.domain.build import BuildResult, PackageRewriteReport
 from quest_renamer.domain.installation import BundleInstallResult, InstalledObb
-from quest_renamer.domain.library import GameProfile, LibraryObb
+from quest_renamer.domain.library import GameProfile, LibraryObb, QuestIdentityRecord
 from quest_renamer.domain.models import BundleDraft, DeviceSnapshot, InstalledQuestApp
 from quest_renamer.infrastructure.app_paths import AppPaths
 from quest_renamer.infrastructure.library_store import GameLibraryStore
@@ -26,6 +26,28 @@ class UpdateAnalyzer:
 class DifferentGameAnalyzer:
     def analyze(self, apk: Path, **kwargs: object) -> ApkAnalysis:
         return ApkAnalysis(apk.resolve(), "com.other.game", version_code="47")
+
+
+class RecordingQuestIdentityStore:
+    def __init__(self, cache_root: Path | None = None) -> None:
+        self.cache_root = cache_root or Path(tempfile.gettempdir()) / "qapkr-test-cache"
+        self.records: tuple[QuestIdentityRecord, ...] = ()
+        self.saved: list[tuple[str, GameProfile]] = []
+        self.deleted: list[tuple[str, str]] = []
+
+    def load(
+        self, serial: str, installed_packages: set[str]
+    ) -> tuple[QuestIdentityRecord, ...]:
+        del serial
+        return tuple(
+            record for record in self.records if record.package_name in installed_packages
+        )
+
+    def save(self, serial: str, profile: GameProfile) -> None:
+        self.saved.append((serial, profile))
+
+    def delete(self, serial: str, package_name: str) -> None:
+        self.deleted.append((serial, package_name))
 
 
 class LibraryTests(unittest.TestCase):
@@ -138,9 +160,11 @@ class LibraryTests(unittest.TestCase):
             metadata.write_text('{"alias":"q","password":"p"}', encoding="utf-8")
             icon.write_bytes(b"\x89PNG\r\n\x1a\n")
             store = GameLibraryStore(root / "library.json")
+            identities = RecordingQuestIdentityStore()
             controller = LibraryController(
                 store,
                 signing_root=signing,
+                device_identities=identities,  # type: ignore[arg-type]
                 path_opener=lambda _path: True,
             )
             source = BundleDraft(
@@ -183,6 +207,9 @@ class LibraryTests(unittest.TestCase):
                 True,
             )
             installed.obbs[0].source.touch()
+            controller.setDevice(
+                DeviceSnapshot(True, "connected", "QUEST123", "Meta Quest 3")
+            )
             profile = controller.record_install(
                 BundleDraft(
                     output,
@@ -196,15 +223,26 @@ class LibraryTests(unittest.TestCase):
                 "QUEST123",
                 original_package="com.example.game",
             )
+            self._wait_for_archive(controller)
 
-            controller.setShowInstalled(False)
             self.assertEqual(controller.count, 1)
+            self.assertEqual(identities.saved[0][0], "QUEST123")
+            self.assertEqual(store.load(), ())
             self.assertEqual(profile.installed_version, "47")
             self.assertEqual(profile.obbs[0].name, "main.47.com.dev.example.game.obb")
             self.assertEqual(profile.game_name, "Quest Visible Example")
             self.assertEqual(profile.app_icon, str(icon))
-            self.assertEqual(controller.rows[0]["status"], "Ready")
+            self.assertEqual(controller.rows[0]["status"], "Managed")
             self.assertTrue(controller.rows[0]["keyReady"])
+            self.assertTrue(controller.rows[0]["storedOnQuest"])
+
+            controller.deleteSelected()
+            self._wait_for_archive(controller)
+            self.assertEqual(
+                identities.deleted,
+                [("QUEST123", "com.dev.example.game")],
+            )
+            self.assertFalse(controller.rows[0]["managed"])
 
     def test_connected_library_shows_installed_apps_with_saved_identity_overlay(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -230,6 +268,7 @@ class LibraryTests(unittest.TestCase):
                     ),
                 )
             )
+
             library = LibraryController(
                 store,
                 signing_root=signing,
@@ -253,13 +292,91 @@ class LibraryTests(unittest.TestCase):
             )
             direct = next(row for row in library.rows if row["id"] == "com.other.game")
             self.assertEqual(managed["gameName"], "Renamed Example")
-            self.assertEqual(managed["status"], "Saved identity")
+            self.assertEqual(managed["status"], "Managed")
             self.assertTrue(managed["keyReady"])
             self.assertEqual(original["gameName"], "Renamed Example")
             self.assertEqual(original["iconUrl"], managed["iconUrl"])
             self.assertFalse(original["managed"])
             self.assertEqual(direct["status"], "Direct update")
             self.assertEqual(direct["versionText"], "1.1  (code 9)")
+
+    def test_finished_folder_install_after_restart_keeps_its_pending_key(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source_root = root / "source"
+            output = root / "output"
+            signing = root / "signing"
+            source_root.mkdir()
+            output.mkdir()
+            signing.mkdir()
+            source_apk = source_root / "game.apk"
+            output_apk = output / "com.dev.example.game.apk"
+            key = signing / "key.p12"
+            metadata = signing / "identity.json"
+            source_apk.write_bytes(b"source")
+            output_apk.write_bytes(b"signed")
+            key.write_bytes(b"key")
+            metadata.write_text('{"alias":"q","password":"p"}', encoding="utf-8")
+            manifest = output / "release.manifest"
+            report = output / "RENAME-REPORT.json"
+            manifest.touch()
+            report.write_text(
+                '{"packages":{"source":"com.example.game",'
+                '"output":"com.dev.example.game"}}',
+                encoding="utf-8",
+            )
+            store = GameLibraryStore(root / "library.json")
+            before_restart = LibraryController(store, signing_root=signing)
+            before_restart.record_build(
+                BundleDraft(
+                    source_root,
+                    source_apk,
+                    game_name="Example",
+                    package_name="com.example.game",
+                    version_code="47",
+                ),
+                "com.dev.example.game",
+                BuildResult(
+                    output,
+                    output_apk,
+                    (),
+                    manifest,
+                    report,
+                    PackageRewriteReport(1, 1),
+                    signing_keystore=key,
+                    signing_metadata=metadata,
+                ),
+                (),
+            )
+
+            identities = RecordingQuestIdentityStore()
+            after_restart = LibraryController(
+                store,
+                signing_root=signing,
+                device_identities=identities,  # type: ignore[arg-type]
+            )
+            after_restart.setDevice(
+                DeviceSnapshot(True, "connected", "QUEST123", "Meta Quest 3")
+            )
+            profile = after_restart.record_install(
+                BundleDraft(
+                    output,
+                    output_apk,
+                    manifest=manifest,
+                    game_name="Example",
+                    package_name="com.dev.example.game",
+                    version_code="47",
+                ),
+                BundleInstallResult("com.dev.example.game", output_apk, (), True),
+                "QUEST123",
+            )
+            self._wait_for_archive(after_restart)
+
+            self.assertIsNotNone(profile)
+            assert profile is not None
+            self.assertEqual(profile.original_package, "com.example.game")
+            self.assertEqual(identities.saved[0][1].signing_keystore, str(key))
+            self.assertEqual(store.load(), ())
 
     def test_direct_install_updates_live_inventory_without_polluting_key_vault(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -294,9 +411,9 @@ class LibraryTests(unittest.TestCase):
             self.assertEqual(library.rows[0]["gameName"], "Example Game")
             self.assertFalse(library.rows[0]["managed"])
             library.setShowInstalled(False)
-            self.assertEqual(library.count, 0)
+            self.assertEqual(library.count, 1)
 
-    def test_connected_headset_auto_selects_live_mode_without_overriding_choice(
+    def test_library_is_always_the_connected_headset_view(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -313,13 +430,13 @@ class LibraryTests(unittest.TestCase):
 
             library.setShowInstalled(False)
             library.setDevice(snapshot)
-            self.assertFalse(library.showInstalled)
+            self.assertTrue(library.showInstalled)
 
             library.setDevice(DeviceSnapshot(False, "disconnected"))
             library.setDevice(snapshot)
             self.assertTrue(library.showInstalled)
 
-    def test_vault_can_copy_complete_information_and_forget_an_identity(self) -> None:
+    def test_migration_identity_information_can_be_copied_for_an_installed_app(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             key = root / "key.p12"
@@ -342,17 +459,20 @@ class LibraryTests(unittest.TestCase):
             library = LibraryController(
                 store,
                 signing_root=root / "signing",
+                installed_apps=lambda _serial: (
+                    InstalledQuestApp("com.dev.example.game", "1"),
+                ),
                 clipboard_writer=lambda value: not copied.append(value),
             )
-            library.setShowInstalled(False)
+            library.setDevice(
+                DeviceSnapshot(True, "connected", "QUEST123", "Meta Quest 3")
+            )
+            self._wait_for_library(library)
 
             library.copySelectedInformation()
 
             self.assertIn("Original package: com.example.game", copied[0])
             self.assertIn('"password": "copy-me"', copied[0])
-            library.deleteSelected()
-            self.assertEqual(store.load(), ())
-            self.assertTrue(key.is_file())
 
     def test_vault_exports_and_imports_a_complete_list(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -373,17 +493,36 @@ class LibraryTests(unittest.TestCase):
             )
             source_store = GameLibraryStore(root / "source-library.json")
             source_store.save((profile,))
-            source = LibraryController(source_store, signing_root=root / "source-signing")
+            source = LibraryController(
+                source_store,
+                signing_root=root / "source-signing",
+                installed_apps=lambda _serial: (
+                    InstalledQuestApp("com.dev.example.game", "1"),
+                ),
+            )
+            source.setDevice(
+                DeviceSnapshot(True, "connected", "QUEST123", "Meta Quest 3")
+            )
+            self._wait_for_library(source)
             archive = root / "saved-library.qarlib"
 
             source.exportAll(QUrl.fromLocalFile(str(archive)))
             self._wait_for_archive(source)
 
             destination_store = GameLibraryStore(root / "destination-library.json")
+            destination_identities = RecordingQuestIdentityStore(root / "identity-cache")
             destination = LibraryController(
                 destination_store,
                 signing_root=root / "destination-signing",
+                installed_apps=lambda _serial: (
+                    InstalledQuestApp("com.dev.example.game", "1"),
+                ),
+                device_identities=destination_identities,  # type: ignore[arg-type]
             )
+            destination.setDevice(
+                DeviceSnapshot(True, "connected", "QUEST456", "Meta Quest 3S")
+            )
+            self._wait_for_library(destination)
             prompts: list[str] = []
             destination.importConfirmationRequested.connect(prompts.append)
             destination.prepareImport(QUrl.fromLocalFile(str(archive)))
@@ -393,13 +532,14 @@ class LibraryTests(unittest.TestCase):
             destination.confirmImport()
             self._wait_for_archive(destination)
 
-            self.assertFalse(destination.showInstalled)
+            self.assertTrue(destination.showInstalled)
             self.assertEqual(destination.count, 1)
             imported = destination.profile(profile.id)
             self.assertIsNotNone(imported)
             assert imported is not None
             self.assertTrue(imported.key_available)
             self.assertNotEqual(imported.signing_keystore, profile.signing_keystore)
+            self.assertEqual(destination_identities.saved[0][0], "QUEST456")
 
     def test_saved_identities_with_equal_display_names_share_an_icon(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -423,8 +563,18 @@ class LibraryTests(unittest.TestCase):
                 )
             )
 
-            library = LibraryController(store, signing_root=root / "signing")
-            library.setShowInstalled(False)
+            library = LibraryController(
+                store,
+                signing_root=root / "signing",
+                installed_apps=lambda _serial: (
+                    InstalledQuestApp("com.dev.example.game", "1"),
+                    InstalledQuestApp("com.qa.example.game", "1"),
+                ),
+            )
+            library.setDevice(
+                DeviceSnapshot(True, "connected", "QUEST123", "Meta Quest 3")
+            )
+            self._wait_for_library(library)
 
             self.assertEqual(library.rows[0]["iconUrl"], library.rows[1]["iconUrl"])
 
@@ -447,8 +597,17 @@ class LibraryTests(unittest.TestCase):
                     ),
                 )
             )
-            library = LibraryController(store, signing_root=root / "signing")
-            library.setShowInstalled(False)
+            library = LibraryController(
+                store,
+                signing_root=root / "signing",
+                installed_apps=lambda _serial: (
+                    InstalledQuestApp("com.dev.example.game", "1"),
+                ),
+            )
+            library.setDevice(
+                DeviceSnapshot(True, "connected", "QUEST123", "Meta Quest 3")
+            )
+            self._wait_for_library(library)
 
             first = library.rows
             self.assertIs(first, library.rows)
@@ -515,7 +674,17 @@ class LibraryTests(unittest.TestCase):
                 signing_metadata=str(metadata),
             )
             store.save((profile,))
-            library = LibraryController(store, signing_root=signing)
+            library = LibraryController(
+                store,
+                signing_root=signing,
+                installed_apps=lambda _serial: (
+                    InstalledQuestApp("com.qa.example.game", "42"),
+                ),
+            )
+            library.setDevice(
+                DeviceSnapshot(True, "connected", "QUEST123", "Meta Quest 3")
+            )
+            self._wait_for_library(library)
             controller = AppController(
                 analyzer=UpdateAnalyzer(),
                 preflight_service=AutomaticPreflight(tools_ready=True),
@@ -528,10 +697,7 @@ class LibraryTests(unittest.TestCase):
             self._wait_for_analysis(controller)
 
             self.assertEqual(controller.packageId, "com.qa.example.game")
-            self.assertEqual(
-                controller.libraryMatch,
-                "Saved signing identity restored automatically",
-            )
+            self.assertIn("Saved signing identity", controller.libraryMatch)
             request = controller._build_request()
             self.assertIsNotNone(request)
             self.assertEqual(request.signing_keystore, key)  # type: ignore[union-attr]
@@ -550,7 +716,17 @@ class LibraryTests(unittest.TestCase):
                 target_package="com.dev.example.game",
             )
             store.save((profile,))
-            library = LibraryController(store, signing_root=root / "signing")
+            library = LibraryController(
+                store,
+                signing_root=root / "signing",
+                installed_apps=lambda _serial: (
+                    InstalledQuestApp("com.dev.example.game", "42"),
+                ),
+            )
+            library.setDevice(
+                DeviceSnapshot(True, "connected", "QUEST123", "Meta Quest 3")
+            )
+            self._wait_for_library(library)
             controller = AppController(
                 analyzer=DifferentGameAnalyzer(),
                 preflight_service=AutomaticPreflight(tools_ready=True),
@@ -559,13 +735,13 @@ class LibraryTests(unittest.TestCase):
                 paths=AppPaths(root / "data", root / "cache"),
             )
 
-            controller.prepareLibraryUpdate(profile.id)
+            controller.prepareLibraryUpdate(profile.target_package)
             controller.chooseLibraryUpdate(QUrl.fromLocalFile(str(source)))
             self._wait_for_analysis(controller)
 
             self.assertEqual(controller.packageId, "")
             self.assertEqual(controller.libraryMatch, "")
-            self.assertIn("Installed on headset", controller.notice)
+            self.assertIn("different game", controller.notice)
 
     def test_missing_saved_key_blocks_an_installed_library_update(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -583,7 +759,17 @@ class LibraryTests(unittest.TestCase):
                 signing_metadata=str(root / "missing.json"),
             )
             store.save((profile,))
-            library = LibraryController(store, signing_root=root / "signing")
+            library = LibraryController(
+                store,
+                signing_root=root / "signing",
+                installed_apps=lambda _serial: (
+                    InstalledQuestApp("com.dev.example.game", "42"),
+                ),
+            )
+            library.setDevice(
+                DeviceSnapshot(True, "connected", "QUEST123", "Meta Quest 3")
+            )
+            self._wait_for_library(library)
             controller = AppController(
                 analyzer=UpdateAnalyzer(),
                 preflight_service=AutomaticPreflight(tools_ready=True),
@@ -597,6 +783,41 @@ class LibraryTests(unittest.TestCase):
 
             self.assertFalse(controller.canBuild)
             self.assertIn("signing key", controller.notice)
+
+    def test_corrupt_headset_identity_blocks_update_selection(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            identities = RecordingQuestIdentityStore(root / "identity-cache")
+            identities.records = (
+                QuestIdentityRecord(
+                    "com.dev.example.game",
+                    error="QAPKR signing identity failed its checksum check.",
+                ),
+            )
+            library = LibraryController(
+                GameLibraryStore(root / "library.json"),
+                signing_root=root / "signing",
+                installed_apps=lambda _serial: (
+                    InstalledQuestApp("com.dev.example.game", "42"),
+                ),
+                device_identities=identities,  # type: ignore[arg-type]
+            )
+            library.setDevice(
+                DeviceSnapshot(True, "connected", "QUEST123", "Meta Quest 3")
+            )
+            self._wait_for_library(library)
+            controller = AppController(
+                analyzer=UpdateAnalyzer(),
+                preflight_service=AutomaticPreflight(tools_ready=True),
+                build_engine=object(),  # type: ignore[arg-type]
+                library_controller=library,
+                paths=AppPaths(root / "data", root / "cache"),
+            )
+
+            controller.prepareLibraryUpdate("com.dev.example.game")
+
+            self.assertIn("needs attention", controller.notice)
+            self.assertEqual(library.rows[0]["status"], "Key issue")
 
     def test_plain_installed_app_update_is_kept_unmodified(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

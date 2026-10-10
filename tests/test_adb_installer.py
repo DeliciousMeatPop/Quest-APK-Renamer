@@ -16,11 +16,16 @@ class BundleRunner:
         self.remote_size = remote_size
         self.install_success = install_success
         self.commands: list[tuple[str, ...]] = []
+        self.remote: dict[str, bytes] = {}
 
     def run(self, arguments: object, **kwargs: object) -> CommandResult:
         command = tuple(str(value) for value in arguments)  # type: ignore[union-attr]
         self.commands.append(command)
-        if "install" in command:
+        if "push" in command:
+            index = command.index("push")
+            self.remote[command[index + 2]] = Path(command[index + 1]).read_bytes()
+            output = ()
+        elif "install" in command:
             output = (
                 ("Performing Streamed Install", "Success")
                 if self.install_success
@@ -28,6 +33,13 @@ class BundleRunner:
             )
         elif "stat" in command:
             output = (str(self.remote_size),)
+        elif "sha256sum" in command:
+            data = self.remote.get(command[-1])
+            output = (
+                (f"{hashlib.sha256(data).hexdigest()}  {command[-1]}",)
+                if data is not None
+                else ()
+            )
         elif "pm" in command and "path" in command:
             output = ("package:/data/app/com.example.game/base.apk",)
         else:
@@ -42,6 +54,7 @@ class MemoryQuestRunner:
         *,
         install_success: bool = True,
         package_verify_success: bool = True,
+        corrupt_obb_during_push: bool = False,
         corrupt_obb_after_install: bool = False,
         install_failure_line: str = "",
     ) -> None:
@@ -49,6 +62,7 @@ class MemoryQuestRunner:
         self.install_success = install_success
         self.install_failure_line = install_failure_line
         self.package_verify_success = package_verify_success
+        self.corrupt_obb_during_push = corrupt_obb_during_push
         self.corrupt_obb_after_install = corrupt_obb_after_install
         self.commands: list[tuple[str, ...]] = []
 
@@ -57,7 +71,10 @@ class MemoryQuestRunner:
         self.commands.append(command)
         if "push" in command:
             index = command.index("push")
-            self.remote[command[index + 2]] = Path(command[index + 1]).read_bytes()
+            data = Path(command[index + 1]).read_bytes()
+            if self.corrupt_obb_during_push and data:
+                data = bytes([data[0] ^ 0xFF]) + data[1:]
+            self.remote[command[index + 2]] = data
             return CommandResult(command, 0, ())
         if "install" in command:
             if self.install_success and self.corrupt_obb_after_install:
@@ -184,6 +201,33 @@ class AdbInstallerTests(unittest.TestCase):
                 installer.install_bundle(bundle, "QUEST123", allow_existing=True)
 
             self.assertEqual(raised.exception.failed_obbs, (obb,))
+
+    def test_bundle_install_rejects_same_size_obb_corruption_before_activation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            adb = root / "adb"
+            apk = root / "game.apk"
+            obb = root / "main.42.com.example.game.obb"
+            adb.touch()
+            apk.write_bytes(b"apk")
+            obb.write_bytes(b"obb-data")
+            remote_root = "/sdcard/Android/obb/com.example.game"
+            previous_path = f"{remote_root}/{obb.name}"
+            runner = MemoryQuestRunner(
+                {previous_path: b"old-data"}, corrupt_obb_during_push=True
+            )
+            installer = AdbApkInstaller(runner=runner)  # type: ignore[arg-type]
+            bundle = BundleDraft(root, apk, (obb,), package_name="com.example.game")
+
+            with (
+                patch.dict("os.environ", {"QAR_ADB": str(adb)}),
+                self.assertRaisesRegex(BundleInstallError, "did not match") as raised,
+            ):
+                installer.install_bundle(bundle, "QUEST123", allow_existing=True)
+
+            self.assertEqual(raised.exception.failed_obbs, (obb,))
+            self.assertEqual(runner.remote, {previous_path: b"old-data"})
+            self.assertFalse(any("install" in command for command in runner.commands))
 
     def test_obb_retry_does_not_reinstall_the_apk(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -1098,11 +1098,11 @@ class AppController(QObject):
     @Slot(object)
     def _apply_device_snapshot(self, snapshot: object) -> None:
         self._device_check_running = False
-        if self._device_refresh_pending:
-            self._device_refresh_pending = False
-            self.refreshDevice()
-            return
+        refresh_again = self._device_refresh_pending
+        self._device_refresh_pending = False
         if not isinstance(snapshot, DeviceSnapshot):
+            if refresh_again:
+                QTimer.singleShot(0, self.refreshDevice)
             return
         previous = (self._device.status, self._device.serial)
         current = (snapshot.status, snapshot.serial)
@@ -1131,6 +1131,13 @@ class AppController(QObject):
             self.readinessChanged.emit()
         if current != previous:
             self._record_activity(f"Device: {self._device_title()}. {snapshot.detail}")
+        # A timer tick or user action may have requested another check while this
+        # one was in flight. Keep the useful result we just received, then start a
+        # fresh poll on the next event-loop turn. Discarding the result here could
+        # starve the UI indefinitely when every ADB snapshot takes longer than the
+        # polling interval.
+        if refresh_again:
+            QTimer.singleShot(0, self.refreshDevice)
 
     @Slot(str, bool)
     def setSetting(self, name: str, value: bool) -> None:
@@ -1451,6 +1458,16 @@ class AppController(QObject):
             self._set_notice(
                 "Choose an app from Installed on headset before selecting its update.",
                 "warning",
+            )
+            return
+        identity_error = self._library_controller.identity_error(app.package_name)
+        if identity_error:
+            self._pending_library_profile_id = ""
+            self._pending_library_package = ""
+            self._set_notice(
+                "This app's QAPKR update key needs attention. Restore or remove it "
+                "from Library before choosing an update.",
+                "error",
             )
             return
         profile = self._library_controller.profile_for_installed(app.package_name)
@@ -2069,6 +2086,7 @@ class AppController(QObject):
             if original_package != requested_package:
                 self._matched_library_profile_id = ""
                 self._direct_library_update_package = requested_package
+                self._package_id = ""
                 self._set_notice(
                     "That APK belongs to a different app than the one selected on the "
                     "Quest.",
@@ -2104,6 +2122,7 @@ class AppController(QObject):
         if requested is not None and requested.original_package != original_package:
             self._matched_library_profile_id = ""
             self._direct_library_update_package = ""
+            self._package_id = ""
             self._set_notice(
                 "That update belongs to a different game, so the saved identity was not used.",
                 "error",
@@ -2152,7 +2171,7 @@ class AppController(QObject):
         if profile.output_path and not self._settings.replace_source_after_build:
             self._output_parent = Path(profile.output_path).expanduser().parent
             self._output_override = None
-        library.select(profile.id)
+        library.select(profile.target_package)
         current = self._bundle.version_code if self._bundle else ""
         previous = library.installed_version(profile.target_package)
         detail = f" Quest {previous} → {current}." if previous and current else "."
@@ -2549,7 +2568,11 @@ class AppController(QObject):
                     ("Duration", self._elapsed(self._install_started_at)),
                     ("Package", raw_outcome.result.package_name),
                     ("APK verification", "Installed package confirmed"),
-                    ("OBB verification", f"{obb_count} remote file sizes confirmed"),
+                    (
+                        "OBB verification",
+                        f"{obb_count} remote file sizes confirmed; "
+                        f"{uploaded_obbs} upload checksum-verified",
+                    ),
                     ("OBBs uploaded", str(uploaded_obbs)),
                     ("OBBs reused on Quest", str(reused_obbs)),
                     ("OBBs already current", str(unchanged_obbs)),

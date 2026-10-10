@@ -189,13 +189,18 @@ def replace_package_references(
 
     for path, relative, size in iter_decoded_files(decoded):
         token.raise_if_cancelled()
-        if size > MAX_SCAN_SIZE:
-            continue
         if is_technical_file(relative):
+            if size > MAX_SCAN_SIZE:
+                raise ValueError(
+                    f"Android technical file is too large to rewrite safely: {relative} "
+                    f"({size / 1024**2:.1f} MiB; limit {MAX_SCAN_SIZE / 1024**2:.0f} MiB)."
+                )
             try:
                 data = path.read_bytes()
-            except OSError:
-                continue
+            except OSError as exc:
+                raise ValueError(
+                    f"Android technical file could not be read: {relative} ({exc})."
+                ) from exc
             saved: list[str] = []
             if relative == MANIFEST_NAME:
                 text, qualified_components = qualify_manifest_components(
@@ -212,9 +217,16 @@ def replace_package_references(
             namespace_references += namespace
             if not occurrences and not (relative == MANIFEST_NAME and qualified_components):
                 continue
-            path.write_bytes(updated)
+            try:
+                path.write_bytes(updated)
+            except OSError as exc:
+                raise ValueError(
+                    f"Android technical file could not be updated: {relative} ({exc})."
+                ) from exc
             changed_files += 1
             changed_occurrences += occurrences
+            continue
+        if size > MAX_SCAN_SIZE:
             continue
         counts = count_file_patterns(path, patterns, token, max_size=MAX_SCAN_SIZE, size=size)
         if counts is None or not sum(counts):
