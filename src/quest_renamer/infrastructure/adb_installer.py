@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import re
+import shlex
 import threading
 import time
 import uuid
@@ -198,6 +200,11 @@ class AdbApkInstaller:
         # Only a bundle that supplies the complete OBB set may prune others.
         expected = {obb.name for obb in bundle.obbs} if bundle.obbs else None
         self._finish_obb_sync_safely(bundle, prepared, target, token, log, expected=expected)
+        try:
+            self._sync_extra_files(bundle, target, token, progress, log)
+        except BundleInstallError as exc:
+            exc.apk_installed = True
+            raise
         progress(1.0, "Install verified")
         return BundleInstallResult(
             bundle.package_name,
@@ -205,6 +212,80 @@ class AdbApkInstaller:
             self._installed_obbs(prepared),
             True,
         )
+
+    @staticmethod
+    def _extra_files(bundle: BundleDraft) -> tuple[tuple[Path, str], ...]:
+        """Non-OBB files in the bundle's OBB folder with their path below it."""
+        source_dir = bundle.root / bundle.package_name
+        if not bundle.package_name or not source_dir.is_dir():
+            return ()
+        found: list[tuple[Path, str]] = []
+        for directory, _folders, names in os.walk(source_dir):
+            for name in names:
+                path = Path(directory) / name
+                if path.suffix.lower() == ".obb" or path.is_symlink() or not path.is_file():
+                    continue
+                found.append((path, path.relative_to(source_dir).as_posix()))
+        return tuple(sorted(found, key=lambda item: item[1]))
+
+    def _sync_extra_files(
+        self,
+        bundle: BundleDraft,
+        target: tuple[Path, str, str],
+        token: CancellationToken,
+        progress: Callable[[float, str], None],
+        log: Callable[[str], None],
+    ) -> None:
+        """Push the other files of the OBB folder, skipping ones already identical."""
+        extras = self._extra_files(bundle)
+        remote_root = f"/sdcard/Android/obb/{bundle.package_name}"
+        for index, (source, relative) in enumerate(extras, start=1):
+            token.raise_if_cancelled()
+            remote_path = f"{remote_root}/{relative}"
+            progress(0.97, f"Copying OBB-folder file {index} of {len(extras)} • {relative}")
+            size = source.stat().st_size
+            local_hash = self._local_sha256(source, token)
+            if (
+                self._remote_file_size(target, shlex.quote(remote_path), token, log) == size
+                and self._remote_sha256(target, shlex.quote(remote_path), token, log)
+                == local_hash
+            ):
+                log(f"OBB-folder file already matches on Quest: {relative}")
+                continue
+            parent = remote_path.rsplit("/", 1)[0]
+            staged = f"{parent}/.qar-new-{uuid.uuid4().hex[:12]}-{source.name}"
+            self.runner.run((*target, "shell", "mkdir", "-p", shlex.quote(parent)), log=log)
+            try:
+                self.runner.run(
+                    (*target, "push", source, staged),
+                    token=token,
+                    log=log,
+                    timeout=_transfer_timeout(size),
+                )
+                verified = (
+                    self._remote_file_size(target, shlex.quote(staged), token, log) == size
+                    and self._remote_sha256(target, shlex.quote(staged), token, log)
+                    == local_hash
+                )
+                if not verified:
+                    raise BundleInstallError(
+                        f"The Quest did not receive {relative} intact."
+                    )
+                self.runner.run(
+                    (
+                        *target,
+                        "shell",
+                        "mv",
+                        "-f",
+                        shlex.quote(staged),
+                        shlex.quote(remote_path),
+                    ),
+                    log=log,
+                )
+            except BaseException:
+                self._remove_remote(target, shlex.quote(staged), log)
+                raise
+            log(f"Copied OBB-folder file to Quest: {relative}")
 
     def retry_obbs(
         self,
