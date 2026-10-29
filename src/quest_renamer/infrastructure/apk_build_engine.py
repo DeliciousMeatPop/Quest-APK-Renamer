@@ -30,6 +30,7 @@ from quest_renamer.infrastructure.build_recovery import (
 )
 from quest_renamer.infrastructure.bundle_output import (
     copy_file,
+    extra_package_files,
     obb_destinations,
     write_build_report,
     write_release_manifest,
@@ -478,6 +479,20 @@ class StagedApkBuildEngine:
                         completed += source_obb.stat().st_size
                         obb_outputs.append(destination)
 
+                extra_outputs: list[Path] = []
+                extras = extra_package_files(request) if request.copy_obbs else ()
+                for index, (source_extra, relative) in enumerate(extras, start=1):
+                    progress(
+                        0.95,
+                        f"Copying OBB-folder file {index} of {len(extras)} • "
+                        f"{source_extra.name}",
+                    )
+                    destination = staging / relative
+                    copy_file(source_extra, destination, token=token)
+                    extra_outputs.append(destination)
+                if extra_outputs:
+                    log(f"Copied {len(extra_outputs)} non-OBB file(s) from the OBB folder.")
+
                 progress(0.96, "Writing bundle metadata")
                 manifest = write_release_manifest(
                     request,
@@ -493,6 +508,7 @@ class StagedApkBuildEngine:
                     tuple(obb_outputs),
                     rewrite,
                     token=token,
+                    extra_files=tuple(extra_outputs),
                 )
                 app_icon = cache_decoded_app_icon(
                     decoded,

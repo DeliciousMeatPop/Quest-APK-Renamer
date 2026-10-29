@@ -6,6 +6,7 @@ import csv
 import datetime as dt
 import hashlib
 import json
+import os
 import shutil
 from collections.abc import Callable
 from pathlib import Path
@@ -53,6 +54,27 @@ def obb_destinations(request: BuildRequest, output_root: Path) -> tuple[Path, ..
         target_package=request.package_name,
     )
     return tuple(output_root / request.package_name / name for name in names)
+
+
+def extra_package_files(request: BuildRequest) -> tuple[tuple[Path, Path], ...]:
+    """Non-OBB files inside the source's OBB folder, paired with their relative output path.
+
+    Games sometimes ship loose data beside their OBBs in ``<package>/``. They belong
+    in the renamed ``<new package>/`` folder, so they are carried over unchanged.
+    """
+    source_dir = request.source.root / request.source.package_name
+    if not request.source.package_name or not source_dir.is_dir():
+        return ()
+    found: list[tuple[Path, Path]] = []
+    for directory, _folders, names in os.walk(source_dir):
+        for name in sorted(names):
+            path = Path(directory) / name
+            if path.suffix.lower() == ".obb" or path.is_symlink() or not path.is_file():
+                continue
+            found.append(
+                (path, Path(request.package_name) / path.relative_to(source_dir))
+            )
+    return tuple(sorted(found))
 
 
 def write_release_manifest(
@@ -125,6 +147,7 @@ def write_build_report(
     rewrite: PackageRewriteReport,
     *,
     token: CancellationToken,
+    extra_files: tuple[Path, ...] = (),
 ) -> Path:
     created = dt.datetime.now(dt.UTC)
     source_signer = (
@@ -172,6 +195,7 @@ def write_build_report(
             "signature_verified": request.sign_apk,
         },
         "obbs": obb_rows,
+        "extra_files": [path.relative_to(output_root).as_posix() for path in extra_files],
         "rewrite": {
             "changed_files": rewrite.changed_files,
             "changed_occurrences": rewrite.changed_occurrences,
@@ -271,6 +295,7 @@ def write_build_report(
                 ),
                 f"Compatibility patches:         {patches}",
                 f"OBB files renamed:              {len(obbs)}",
+                f"Other OBB-folder files copied:  {len(extra_files)}",
                 "In-game text:                   Left unchanged",
                 "",
                 "OBB FILES",
