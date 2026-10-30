@@ -6,7 +6,6 @@ import csv
 import datetime as dt
 import hashlib
 import json
-import os
 import shutil
 from collections.abc import Callable
 from pathlib import Path
@@ -16,6 +15,7 @@ from quest_renamer.domain.build import PackageRewriteReport
 from quest_renamer.domain.models import BuildRequest
 from quest_renamer.domain.obb_names import renamed_obb_filenames
 from quest_renamer.domain.operations import CancellationToken
+from quest_renamer.domain.package_ids import is_valid_package_id
 
 
 def copy_file(
@@ -62,19 +62,13 @@ def extra_package_files(request: BuildRequest) -> tuple[tuple[Path, Path], ...]:
     Games sometimes ship loose data beside their OBBs in ``<package>/``. They belong
     in the renamed ``<new package>/`` folder, so they are carried over unchanged.
     """
+    if not is_valid_package_id(request.package_name):
+        raise ValueError("The output package ID is invalid.")
     source_dir = request.source.root / request.source.package_name
-    if not request.source.package_name or not source_dir.is_dir():
-        return ()
-    found: list[tuple[Path, Path]] = []
-    for directory, _folders, names in os.walk(source_dir):
-        for name in sorted(names):
-            path = Path(directory) / name
-            if path.suffix.lower() == ".obb" or path.is_symlink() or not path.is_file():
-                continue
-            found.append(
-                (path, Path(request.package_name) / path.relative_to(source_dir))
-            )
-    return tuple(sorted(found))
+    return tuple(
+        (path, Path(request.package_name) / path.relative_to(source_dir))
+        for path in request.source.extra_files
+    )
 
 
 def write_release_manifest(
@@ -87,6 +81,11 @@ def write_release_manifest(
 ) -> Path:
     """Write ``release.manifest``; ``release_name`` is the final visible folder name."""
     total_size = apk.stat().st_size + sum(path.stat().st_size for path in obbs)
+    total_size += sum(
+        path.stat().st_size
+        for path in (output_root / relative for _, relative in extra_package_files(request))
+        if path.is_file()
+    )
     updated = dt.datetime.now(dt.UTC).strftime("%Y-%m-%d %H:%M UTC")
     rows = [
         ["#VRPRELEASEMANIFEST 1.0"],

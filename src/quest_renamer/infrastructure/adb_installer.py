@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import os
 import re
 import shlex
 import threading
@@ -11,7 +10,7 @@ import time
 import uuid
 from collections import OrderedDict
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from quest_renamer.domain.installation import (
@@ -23,6 +22,7 @@ from quest_renamer.domain.installation import (
 from quest_renamer.domain.models import BundleDraft
 from quest_renamer.domain.obb_names import parse_obb_filename
 from quest_renamer.domain.operations import CancellationToken, OperationCancelled
+from quest_renamer.domain.package_files import validate_extra_path
 from quest_renamer.domain.package_ids import is_valid_package_id
 from quest_renamer.infrastructure.adb_device import find_adb
 from quest_renamer.infrastructure.process_runner import (
@@ -166,6 +166,7 @@ class AdbApkInstaller:
         progress = progress or (lambda _value, _message: None)
         log = log or (lambda _message: None)
         target = self._validated_target(bundle, serial)
+        bundle = replace(bundle, auxiliary_files=bundle.extra_files)
 
         token.raise_if_cancelled()
         progress(0.02, "Checking installed package")
@@ -216,17 +217,10 @@ class AdbApkInstaller:
     @staticmethod
     def _extra_files(bundle: BundleDraft) -> tuple[tuple[Path, str], ...]:
         """Non-OBB files in the bundle's OBB folder with their path below it."""
-        source_dir = bundle.root / bundle.package_name
-        if not bundle.package_name or not source_dir.is_dir():
-            return ()
-        found: list[tuple[Path, str]] = []
-        for directory, _folders, names in os.walk(source_dir):
-            for name in names:
-                path = Path(directory) / name
-                if path.suffix.lower() == ".obb" or path.is_symlink() or not path.is_file():
-                    continue
-                found.append((path, path.relative_to(source_dir).as_posix()))
-        return tuple(sorted(found, key=lambda item: item[1]))
+        return tuple(
+            (path, validate_extra_path(path, bundle.root / bundle.package_name))
+            for path in bundle.extra_files
+        )
 
     def _sync_extra_files(
         self,
@@ -239,38 +233,68 @@ class AdbApkInstaller:
         """Push the other files of the OBB folder, skipping ones already identical."""
         extras = self._extra_files(bundle)
         remote_root = f"/sdcard/Android/obb/{bundle.package_name}"
+        total = sum(path.stat().st_size for path, _ in extras)
+        completed = 0
         for index, (source, relative) in enumerate(extras, start=1):
             token.raise_if_cancelled()
             remote_path = f"{remote_root}/{relative}"
-            progress(0.97, f"Copying OBB-folder file {index} of {len(extras)} • {relative}")
             size = source.stat().st_size
-            local_hash = self._local_sha256(source, token)
-            if (
-                self._remote_file_size(target, shlex.quote(remote_path), token, log) == size
-                and self._remote_sha256(target, shlex.quote(remote_path), token, log)
-                == local_hash
-            ):
-                log(f"OBB-folder file already matches on Quest: {relative}")
-                continue
+
+            def report(
+                fraction: float,
+                detail: str,
+                *,
+                base: int = completed,
+                file_size: int = size,
+                number: int = index,
+                name: str = relative,
+            ) -> None:
+                portion = (
+                    (base + fraction * file_size) / total if total else number / len(extras)
+                )
+                progress(
+                    0.96 + 0.03 * portion,
+                    f"Extra file {number} of {len(extras)} • {name} • {detail}",
+                )
+
             parent = remote_path.rsplit("/", 1)[0]
             staged = f"{parent}/.qar-new-{uuid.uuid4().hex[:12]}-{source.name}"
-            self.runner.run((*target, "shell", "mkdir", "-p", shlex.quote(parent)), log=log)
             try:
-                self.runner.run(
-                    (*target, "push", source, staged),
+                # Never follow a pre-existing link out of this app's data directory.
+                ancestors = [remote_root]
+                for part in relative.split("/"):
+                    ancestors.append(ancestors[-1] + "/" + part)
+                guard = " || ".join(f"[ -L {shlex.quote(path)} ]" for path in ancestors)
+                links = self.runner.run(
+                    (*target, "shell", f"if {guard}; then echo QAR_SYMLINK; fi"),
                     token=token,
                     log=log,
-                    timeout=_transfer_timeout(size),
                 )
+                if "QAR_SYMLINK" in links.output:
+                    raise BundleInstallError("The Quest destination contains a symbolic link.")
+                report(0.0, "Checking file")
+                local_hash = self._local_sha256(source, token)
+                if (
+                    self._remote_file_size(target, shlex.quote(remote_path), token, log) == size
+                    and self._remote_sha256(target, shlex.quote(remote_path), token, log)
+                    == local_hash
+                ):
+                    log(f"Extra file already matches on Quest: {relative}")
+                    report(1.0, "Already verified")
+                    completed += size
+                    continue
+                self.runner.run(
+                    (*target, "shell", "mkdir", "-p", shlex.quote(parent)), token=token, log=log
+                )
+                self._push_with_progress(target, source, staged, size, token, log, report)
                 verified = (
                     self._remote_file_size(target, shlex.quote(staged), token, log) == size
                     and self._remote_sha256(target, shlex.quote(staged), token, log)
                     == local_hash
                 )
                 if not verified:
-                    raise BundleInstallError(
-                        f"The Quest did not receive {relative} intact."
-                    )
+                    raise BundleInstallError(f"The Quest did not receive {relative} intact.")
+                token.raise_if_cancelled()
                 self.runner.run(
                     (
                         *target,
@@ -282,9 +306,24 @@ class AdbApkInstaller:
                     ),
                     log=log,
                 )
-            except BaseException:
+                if (
+                    self._remote_file_size(target, shlex.quote(remote_path), token, log) != size
+                    or self._remote_sha256(target, shlex.quote(remote_path), token, log)
+                    != local_hash
+                ):
+                    raise BundleInstallError(f"Final verification failed for {relative}.")
+            except OperationCancelled:
                 self._remove_remote(target, shlex.quote(staged), log)
                 raise
+            except Exception as exc:
+                self._remove_remote(target, shlex.quote(staged), log)
+                raise BundleInstallError(
+                    f"Extra file {relative} failed: {exc}",
+                    apk_installed=True,
+                    failed_extra_files=tuple(path for path, _ in extras[index - 1 :]),
+                ) from exc
+            report(1.0, "Verified")
+            completed += size
             log(f"Copied OBB-folder file to Quest: {relative}")
 
     def retry_obbs(
@@ -297,7 +336,7 @@ class AdbApkInstaller:
         log: Callable[[str], None] | None = None,
         keep_obb_names: tuple[str, ...] = (),
     ) -> BundleInstallResult:
-        """Re-synchronize only ``bundle.obbs`` without touching the installed APK.
+        """Retry the selected OBBs and auxiliary files without reinstalling the APK.
 
         ``keep_obb_names`` lists the complete OBB set of the installed game. When it is
         provided, obsolete package-owned files outside that set are pruned after
@@ -307,8 +346,8 @@ class AdbApkInstaller:
         progress = progress or (lambda _value, _message: None)
         log = log or (lambda _message: None)
         target = self._validated_target(bundle, serial)
-        if not bundle.obbs:
-            raise BundleInstallError("There are no failed OBB files to retry.")
+        if not bundle.obbs and not bundle.extra_files:
+            raise BundleInstallError("There are no failed files to retry.")
         progress(0.04, "Preparing OBB retry")
         prepared = self._prepare_obb_sync(bundle, target, token, progress, log)
         try:
@@ -335,7 +374,8 @@ class AdbApkInstaller:
             set(keep_obb_names) | {obb.name for obb in bundle.obbs} if keep_obb_names else None
         )
         self._finish_obb_sync_safely(bundle, prepared, target, token, log, expected=expected)
-        progress(1.0, "OBB retry verified")
+        self._sync_extra_files(bundle, target, token, progress, log)
+        progress(1.0, "File retry verified")
         return BundleInstallResult(
             bundle.package_name,
             bundle.apk,
@@ -555,6 +595,7 @@ class AdbApkInstaller:
             base_progress = 0.12 + ((index - 1) / total) * 0.46
             span = 0.46 / total
             progress(base_progress, self._copy_label(index, total, obb.name, size))
+
             def report_push(
                 fraction: float,
                 detail: str,
@@ -651,7 +692,9 @@ class AdbApkInstaller:
             # Wait before the first probe so short pushes never spawn extra commands.
             while not stop.wait(_PUSH_PROGRESS_INTERVAL):
                 try:
-                    current = self._remote_file_size(target, staged, CancellationToken(), quiet)
+                    current = self._remote_file_size(
+                        target, shlex.quote(staged), CancellationToken(), quiet
+                    )
                 except Exception:
                     continue
                 if current is None or size <= 0:
