@@ -184,7 +184,7 @@ class ExtraFilesTests(unittest.TestCase):
             root = Path(temporary)
             folder = helper._finished_folder(root)
             bundle = LocalBundleInspector().inspect_folder(folder)
-            extra = folder / bundle.package_name / "data.bin"
+            extra = bundle.root / bundle.package_name / "data.bin"
             extra.parent.mkdir(exist_ok=True)
             extra.write_bytes(b"data")
             controller = AppController(paths=AppPaths(data=root / "data", cache=root / "cache"))
