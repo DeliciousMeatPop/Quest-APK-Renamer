@@ -2506,7 +2506,13 @@ class AppController(QObject):
             )
         elif raw_outcome.error:
             if raw_outcome.failed_obbs or raw_outcome.failed_extra_files:
-                self._retry_full_bundle = self._retry_full_bundle or raw_outcome.bundle
+                previous = self._retry_full_bundle
+                if previous is None or (
+                    previous.root != raw_outcome.bundle.root
+                    or previous.apk != raw_outcome.bundle.apk
+                    or previous.package_name != raw_outcome.bundle.package_name
+                ):
+                    self._retry_full_bundle = raw_outcome.bundle
                 self._retry_reinstall = not raw_outcome.apk_installed
                 self._retry_bundle = (
                     raw_outcome.bundle

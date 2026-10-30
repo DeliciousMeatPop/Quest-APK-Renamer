@@ -190,6 +190,8 @@ class ExtraFilesTests(unittest.TestCase):
             controller = AppController(paths=AppPaths(data=root / "data", cache=root / "cache"))
             controller._device = DeviceSnapshot(True, serial="QUEST")
             controller._install_generation = 1
+            # A previous failed game must not become the successful retry's source.
+            controller._retry_full_bundle = replace(bundle, root=root / "another-game")
             with patch.object(controller, "_delete_source_after_verified_install") as delete:
                 controller._apply_install_outcome(
                     1,
@@ -202,6 +204,7 @@ class ExtraFilesTests(unittest.TestCase):
                 )
                 delete.assert_not_called()
                 self.assertTrue(controller.canRetryObbs)
+                self.assertEqual(controller._retry_full_bundle, bundle)
                 self.assertEqual(controller.retryFilesLabel, "Retry failed extra files")
                 retry = controller._retry_bundle
                 assert retry is not None
